@@ -1,0 +1,19 @@
+# Compilación de Cargo
+/target/
+**/*.rs.bk
+
+# Contexto de agentes y notas internas (nunca en git)
+AGENTS.md
+CLAUDE.md
+PROGRESS.md
+START_HERE.md
+
+# Entorno local
+.env
+.env.*
+!.env.example
+
+# Sistema y editores
+.DS_Store
+.idea/
+.vscode/
