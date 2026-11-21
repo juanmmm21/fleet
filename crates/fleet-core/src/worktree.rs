@@ -321,6 +321,131 @@ async fn prepare_environment(
     exclude(config, worktree, &added).await
 }
 
+/// Cómo cambió un fichero respecto a la base de la tarea.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    /// Cambió de tipo (fichero normal, enlace, submódulo).
+    TypeChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileChange {
+    /// Ruta relativa a la raíz del repo, con `/` como separador (lo que da git).
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
+/// Lo que ha hecho una tarea en su worktree respecto al commit del que salió.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diff {
+    /// Commits nuevos en la rama de la tarea.
+    pub commits: u32,
+    /// Si quedan cambios sin commitear (incluidos ficheros nuevos sin añadir).
+    pub uncommitted: bool,
+    /// Ficheros cambiados, commiteados o no, ordenados por ruta.
+    pub files: Vec<FileChange>,
+}
+
+impl Diff {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.commits == 0 && self.files.is_empty()
+    }
+}
+
+/// Mira qué ha cambiado en el worktree desde `base_commit`: lo commiteado, lo que está sin
+/// commitear y los ficheros nuevos que git aún no sigue. Los renombrados salen como un
+/// borrado y un añadido, que es lo que importa para saber si dos tareas se pisan.
+pub async fn diff(config: &WorktreeConfig, worktree: &Worktree) -> Result<Diff, WorktreeError> {
+    let range = format!("{}..HEAD", worktree.base_commit);
+    let count = git(config, &worktree.path, &["rev-list", "--count", &range]).await?;
+    let commits = count
+        .stdout
+        .trim()
+        .parse()
+        .map_err(|_| WorktreeError::Git {
+            cwd: worktree.path.clone(),
+            args: format!("rev-list --count {range}"),
+            stderr: format!("unexpected output `{}`", count.stdout.trim()),
+        })?;
+
+    let tracked = git(
+        config,
+        &worktree.path,
+        &[
+            "diff",
+            "--name-status",
+            "--no-renames",
+            "-z",
+            &worktree.base_commit,
+            "--",
+        ],
+    )
+    .await?;
+    let mut files = parse_name_status(&tracked.stdout).map_err(|stderr| WorktreeError::Git {
+        cwd: worktree.path.clone(),
+        args: "diff --name-status".to_owned(),
+        stderr,
+    })?;
+    let untracked = git(
+        config,
+        &worktree.path,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await?;
+    files.extend(
+        untracked
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| FileChange {
+                path: path.to_owned(),
+                kind: ChangeKind::Added,
+            }),
+    );
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.dedup_by(|a, b| a.path == b.path);
+
+    let status = git(
+        config,
+        &worktree.path,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )
+    .await?;
+    Ok(Diff {
+        commits,
+        uncommitted: !status.stdout.trim().is_empty(),
+        files,
+    })
+}
+
+/// `git diff --name-status -z` sin renombrados: pares `estado\0ruta\0`.
+fn parse_name_status(raw: &str) -> Result<Vec<FileChange>, String> {
+    let mut fields = raw.split('\0').filter(|field| !field.is_empty());
+    let mut files = Vec::new();
+    while let Some(status) = fields.next() {
+        let path = fields
+            .next()
+            .ok_or_else(|| format!("status `{status}` without a path"))?;
+        let kind = match status.chars().next() {
+            Some('A') => ChangeKind::Added,
+            Some('M') => ChangeKind::Modified,
+            Some('D') => ChangeKind::Deleted,
+            Some('T') => ChangeKind::TypeChanged,
+            _ => return Err(format!("unexpected status `{status}` for `{path}`")),
+        };
+        files.push(FileChange {
+            path: path.to_owned(),
+            kind,
+        });
+    }
+    Ok(files)
+}
+
 /// Una entrada se trae al worktree si existe en el checkout y git no la sigue: lo que está
 /// en git ya llega con el checkout del worktree, y pisarlo cambiaría el código de la tarea.
 async fn is_available(

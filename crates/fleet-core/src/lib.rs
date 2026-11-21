@@ -20,7 +20,9 @@ pub use process::{ProcessError, ProcessOutput};
 pub use recovery::{Recovered, Recovery, RecoveryError};
 pub use store::{Store, StoreError};
 pub use task::{NewTaskError, Task, TaskId, TaskIdError, TaskSpec, TaskState, TransitionError};
-pub use worktree::{Removal, Worktree, WorktreeConfig, WorktreeError};
+pub use worktree::{
+    ChangeKind, Diff, FileChange, Removal, Worktree, WorktreeConfig, WorktreeError,
+};
 
 /// Versión de fleet, la misma para los tres crates del workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
