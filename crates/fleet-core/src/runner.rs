@@ -12,7 +12,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::Invocation;
 use crate::process::{self, OutputLine, ProcessError, Stream, StreamEnd, StreamOptions};
-use crate::transcript::{AgentSummary, Transcript};
+use crate::task::{Task, TaskState, TransitionError};
+use crate::transcript::{AgentOutcome, AgentSummary, Transcript};
 use crate::worktree::{self, Diff, Worktree, WorktreeConfig, WorktreeError};
 
 /// Líneas en vuelo entre los lectores y el registro antes de frenar al proceso.
@@ -162,6 +163,52 @@ where
     })
 }
 
+/// Lleva a la tarea al estado que toca tras una vuelta del agente: `waiting` si pregunta,
+/// `preflight` si acabó bien y `failed` con el motivo en cualquier otro caso. Guarda la sesión
+/// para poder retomarla. La tarea tiene que estar en `agent`.
+pub fn settle(task: &mut Task, report: &AgentReport, now_ms: u64) -> Result<(), TransitionError> {
+    if task.state != TaskState::Agent {
+        return Err(TransitionError {
+            from: task.state,
+            to: TaskState::Preflight,
+        });
+    }
+    if let Some(session) = &report.summary.session_id {
+        task.session_id = Some(session.clone());
+    }
+    match failure(report) {
+        Some(reason) => task.fail(reason, now_ms),
+        None => match report.summary.question() {
+            Some(question) => task.ask(question, now_ms),
+            None => task.transition(TaskState::Preflight, now_ms),
+        },
+    }
+}
+
+/// Por qué la vuelta no cuenta como buena, en orden de lo más útil de saber.
+fn failure(report: &AgentReport) -> Option<String> {
+    let summary = &report.summary;
+    if let Some(reason) = &summary.refused {
+        return Some(format!("stopped by fleet: {reason}"));
+    }
+    if summary.quota_exhausted {
+        return Some("the agent ran out of quota".to_owned());
+    }
+    match report.end {
+        StreamEnd::TimedOut => return Some("the agent timed out".to_owned()),
+        StreamEnd::Cancelled => return Some("the agent was cancelled".to_owned()),
+        StreamEnd::Exited(_) => {}
+    }
+    if let Some(AgentOutcome::Error { message }) = &summary.outcome {
+        return Some(format!("the agent failed: {message}"));
+    }
+    match report.end {
+        StreamEnd::Exited(Some(0)) if summary.outcome.is_some() => None,
+        StreamEnd::Exited(Some(0)) => Some("the agent ended without a result".to_owned()),
+        other => Some(format!("the agent {}", describe(other))),
+    }
+}
+
 async fn open_log(path: &Path) -> std::io::Result<BufWriter<File>> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -292,7 +339,137 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::agent::AgentProvider;
+    use crate::task::{TaskId, TaskSpec};
+
+    fn agent_task() -> Result<Task, Box<dyn std::error::Error>> {
+        let spec = TaskSpec {
+            repo: PathBuf::from("/repo"),
+            prompt: "do it".to_owned(),
+            agent: AgentProvider::Claude { model: None },
+            base: "main".to_owned(),
+        };
+        let mut task = Task::new(TaskId::parse("t")?, spec, 1)?;
+        task.transition(TaskState::Agent, 2)?;
+        Ok(task)
+    }
+
+    fn report(end: StreamEnd, outcome: Option<AgentOutcome>) -> AgentReport {
+        AgentReport {
+            end,
+            duration_ms: 10,
+            log: PathBuf::from("/logs/t.log"),
+            output_tail: String::new(),
+            diff: Diff::default(),
+            summary: AgentSummary {
+                session_id: Some("s-1".to_owned()),
+                outcome,
+                ..AgentSummary::default()
+            },
+        }
+    }
+
+    fn success(text: &str) -> Option<AgentOutcome> {
+        Some(AgentOutcome::Success {
+            text: text.to_owned(),
+        })
+    }
+
+    #[test]
+    fn a_good_run_goes_to_preflight_and_keeps_the_session() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut task = agent_task()?;
+        settle(
+            &mut task,
+            &report(StreamEnd::Exited(Some(0)), success("done")),
+            3,
+        )?;
+        assert_eq!(task.state, TaskState::Preflight);
+        assert_eq!(task.session_id.as_deref(), Some("s-1"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_question_waits_and_the_answer_resumes() -> Result<(), Box<dyn std::error::Error>> {
+        let mut task = agent_task()?;
+        let asked = report(StreamEnd::Exited(Some(0)), success("QUESTION: sqlite?"));
+        settle(&mut task, &asked, 3)?;
+        assert_eq!(task.state, TaskState::Waiting);
+        assert_eq!(task.question.as_deref(), Some("sqlite?"));
+        task.transition(TaskState::Agent, 4)?;
+        assert_eq!(task.question, None);
+        assert_eq!(task.session_id.as_deref(), Some("s-1"));
+        Ok(())
+    }
+
+    #[test]
+    fn every_bad_ending_fails_with_its_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let error = Some(AgentOutcome::Error {
+            message: "boom".to_owned(),
+        });
+        let cases = [
+            (report(StreamEnd::TimedOut, None), "the agent timed out"),
+            (
+                report(StreamEnd::Cancelled, success("QUESTION: x")),
+                "the agent was cancelled",
+            ),
+            (
+                report(StreamEnd::Exited(Some(1)), error),
+                "the agent failed: boom",
+            ),
+            (
+                report(StreamEnd::Exited(Some(2)), success("ok")),
+                "the agent exited with code 2",
+            ),
+            (
+                report(StreamEnd::Exited(None), None),
+                "the agent was killed by a signal",
+            ),
+            (
+                report(StreamEnd::Exited(Some(0)), None),
+                "the agent ended without a result",
+            ),
+        ];
+        for (report, reason) in cases {
+            let mut task = agent_task()?;
+            settle(&mut task, &report, 3)?;
+            assert_eq!(task.state, TaskState::Failed);
+            assert_eq!(task.failure.as_deref(), Some(reason));
+        }
+
+        let mut quota = report(StreamEnd::Exited(Some(1)), None);
+        quota.summary.quota_exhausted = true;
+        let mut task = agent_task()?;
+        settle(&mut task, &quota, 3)?;
+        assert_eq!(task.failure.as_deref(), Some("the agent ran out of quota"));
+
+        let mut refused = report(StreamEnd::Cancelled, None);
+        refused.summary.refused = Some("paid key".to_owned());
+        let mut task = agent_task()?;
+        settle(&mut task, &refused, 3)?;
+        assert_eq!(task.failure.as_deref(), Some("stopped by fleet: paid key"));
+        Ok(())
+    }
+
+    #[test]
+    fn settle_only_applies_to_tasks_with_the_agent() -> Result<(), Box<dyn std::error::Error>> {
+        let mut task = agent_task()?;
+        task.transition(TaskState::Preflight, 3)?;
+        let before = task.clone();
+        assert!(
+            settle(
+                &mut task,
+                &report(StreamEnd::Exited(Some(0)), success("ok")),
+                4
+            )
+            .is_err()
+        );
+        assert_eq!(task, before);
+        Ok(())
+    }
 
     #[test]
     fn tail_keeps_whole_lines_within_the_limit() {
