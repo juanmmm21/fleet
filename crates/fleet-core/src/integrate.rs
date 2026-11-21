@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::preflight::{self, PreflightConfig, PreflightError, PreflightPlan, PreflightResult};
 use crate::process;
+use crate::task::{Task, TaskState, TransitionError};
 use crate::worktree::{self, Worktree, WorktreeConfig, WorktreeError};
 
 /// Cómo acabó un intento de integrar.
@@ -112,6 +113,41 @@ where
     })
 }
 
+/// Lleva a una tarea `ready` al estado que toca tras intentar integrarla: `merged`, `failed`
+/// con el motivo (conflicto o pruebas en rojo: la rama se queda para arreglarla) o sigue en
+/// `ready` si `origin` se movió y basta con repetir.
+pub fn settle(
+    task: &mut Task,
+    outcome: &IntegrationOutcome,
+    now_ms: u64,
+) -> Result<(), TransitionError> {
+    if task.state != TaskState::Ready {
+        return Err(TransitionError {
+            from: task.state,
+            to: TaskState::Merged,
+        });
+    }
+    match outcome {
+        IntegrationOutcome::Merged { .. } => task.transition(TaskState::Merged, now_ms),
+        IntegrationOutcome::Conflict { files } => task.fail(
+            format!("conflict with origin/{} in {}", task.base, files.join(", ")),
+            now_ms,
+        ),
+        IntegrationOutcome::Red(result) => {
+            task.preflight = Some(result.clone());
+            task.fail(
+                format!(
+                    "tests fail on top of origin/{}: {}",
+                    task.base,
+                    result.summary()
+                ),
+                now_ms,
+            )
+        }
+        IntegrationOutcome::OriginMoved => Ok(()),
+    }
+}
+
 /// Rebasa sobre `onto`. Con conflictos deshace el rebase y devuelve los ficheros en conflicto;
 /// cualquier otro fallo (sin identidad de git, por ejemplo) también se deshace y es un error.
 async fn rebase(
@@ -170,7 +206,68 @@ fn is_rejected(stderr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::agent::AgentProvider;
+    use crate::task::{TaskId, TaskSpec};
+
+    fn ready_task() -> Result<Task, Box<dyn std::error::Error>> {
+        let spec = TaskSpec {
+            repo: PathBuf::from("/repo"),
+            prompt: "do it".to_owned(),
+            agent: AgentProvider::Claude { model: None },
+            base: "main".to_owned(),
+        };
+        let mut task = Task::new(TaskId::parse("t")?, spec, 1)?;
+        for state in [TaskState::Agent, TaskState::Preflight, TaskState::Ready] {
+            task.transition(state, 2)?;
+        }
+        Ok(task)
+    }
+
+    #[test]
+    fn settle_maps_each_outcome() -> Result<(), Box<dyn std::error::Error>> {
+        let mut task = ready_task()?;
+        settle(&mut task, &IntegrationOutcome::OriginMoved, 3)?;
+        assert_eq!(task.state, TaskState::Ready);
+        settle(
+            &mut task,
+            &IntegrationOutcome::Merged {
+                commit: "abc".to_owned(),
+            },
+            4,
+        )?;
+        assert_eq!(task.state, TaskState::Merged);
+
+        let mut task = ready_task()?;
+        let conflict = IntegrationOutcome::Conflict {
+            files: vec!["a.rs".to_owned(), "b.rs".to_owned()],
+        };
+        settle(&mut task, &conflict, 3)?;
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(
+            task.failure.as_deref(),
+            Some("conflict with origin/main in a.rs, b.rs")
+        );
+
+        let mut task = ready_task()?;
+        let red = PreflightResult {
+            command: vec!["cargo".to_owned(), "test".to_owned()],
+            exit_code: Some(101),
+            timed_out: false,
+            duration_ms: 5,
+            output_tail: String::new(),
+        };
+        settle(&mut task, &IntegrationOutcome::Red(red.clone()), 3)?;
+        assert_eq!(
+            task.failure.as_deref(),
+            Some("tests fail on top of origin/main: `cargo test` exited with code 101")
+        );
+        assert_eq!(task.preflight, Some(red));
+        assert!(settle(&mut task, &IntegrationOutcome::OriginMoved, 4).is_err());
+        Ok(())
+    }
 
     #[test]
     fn recognises_a_rejected_push() {
