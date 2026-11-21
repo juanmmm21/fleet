@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use fleet_core::TaskId;
-use fleet_core::worktree::{self, Removal, WorktreeConfig, WorktreeError};
+use fleet_core::worktree::{
+    self, ChangeKind, Diff, FileChange, Removal, WorktreeConfig, WorktreeError,
+};
 use tempfile::TempDir;
 
 mod common;
@@ -236,5 +238,60 @@ async fn rejects_bad_bases_existing_folders_and_relative_repos() -> TestResult {
     config.linked.push(PathBuf::from("../outside"));
     let escaping = worktree::create(&config, &fx.checkout, &new_id(), "main").await;
     assert!(matches!(escaping, Err(WorktreeError::InvalidEntry(_))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn diff_sees_commits_pending_changes_and_new_files_but_not_the_environment() -> TestResult {
+    let fx = fixture()?;
+    commit_file(&fx.checkout, "old.txt", "old\n")?;
+    git(&fx.checkout, &["push", "--quiet", "origin", "HEAD:main"])?;
+    std::fs::write(fx.checkout.join(".env"), "TOKEN=secret\n")?;
+    std::fs::create_dir_all(fx.checkout.join("node_modules"))?;
+    std::fs::write(fx.checkout.join("AGENTS.md"), "rules\n")?;
+
+    let wt = worktree::create(&fx.config, &fx.checkout, &new_id(), "main").await?;
+    assert_eq!(worktree::diff(&fx.config, &wt).await?, Diff::default());
+    assert!(worktree::diff(&fx.config, &wt).await?.is_empty());
+
+    commit_file(&wt.path, "src.rs", "fn main() {}\n")?;
+    git(&wt.path, &["rm", "--quiet", "old.txt"])?;
+    git(&wt.path, &["commit", "--quiet", "-m", "drop old"])?;
+    std::fs::write(wt.path.join("README.md"), "app, edited\n")?;
+    std::fs::create_dir_all(wt.path.join("docs"))?;
+    std::fs::write(wt.path.join("docs").join("new file.md"), "new\n")?;
+
+    let diff = worktree::diff(&fx.config, &wt).await?;
+    assert_eq!(diff.commits, 2);
+    assert!(diff.uncommitted);
+    let change = |path: &str, kind| FileChange {
+        path: path.to_owned(),
+        kind,
+    };
+    assert_eq!(
+        diff.files,
+        [
+            change("README.md", ChangeKind::Modified),
+            change("docs/new file.md", ChangeKind::Added),
+            change("old.txt", ChangeKind::Deleted),
+            change("src.rs", ChangeKind::Added),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn diff_ignores_what_moved_on_in_origin() -> TestResult {
+    let fx = fixture()?;
+    let wt = worktree::create(&fx.config, &fx.checkout, &new_id(), "main").await?;
+    commit_file(&fx.checkout, "elsewhere.txt", "other task\n")?;
+    git(&fx.checkout, &["push", "--quiet", "origin", "HEAD:main"])?;
+    commit_file(&wt.path, "mine.txt", "mine\n")?;
+
+    let diff = worktree::diff(&fx.config, &wt).await?;
+    assert_eq!(diff.commits, 1);
+    assert!(!diff.uncommitted);
+    let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["mine.txt"]);
     Ok(())
 }
