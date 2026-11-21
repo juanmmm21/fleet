@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentProvider;
 use crate::preflight::PreflightResult;
-use crate::worktree::Diff;
+use crate::worktree::{Diff, Worktree};
 
 /// Longitud máxima de un id: va dentro de un nombre de rama y de carpeta.
 const MAX_ID_LEN: usize = 64;
@@ -242,8 +242,8 @@ pub struct Task {
     pub agent: AgentProvider,
     pub base: String,
     pub branch: String,
-    /// Carpeta del worktree, cuando ya existe.
-    pub worktree: Option<PathBuf>,
+    /// El worktree, cuando ya existe: carpeta, rama y commit del que salió.
+    pub worktree: Option<Worktree>,
     pub state: TaskState,
     /// Por qué falló, mientras está en `failed`.
     pub failure: Option<String>,

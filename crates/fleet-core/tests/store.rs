@@ -2,9 +2,21 @@
 
 use std::path::PathBuf;
 
-use fleet_core::{AgentProvider, Store, StoreError, Task, TaskId, TaskSpec, TaskState};
+use fleet_core::{AgentProvider, Store, StoreError, Task, TaskId, TaskSpec, TaskState, Worktree};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+fn worktree(path: &str) -> Worktree {
+    Worktree {
+        repo: PathBuf::from("/home/juan/Desarrollo/fleet"),
+        path: PathBuf::from(path),
+        branch: "fleet/b-working".to_owned(),
+        base: "main".to_owned(),
+        base_commit: "0123abcd".to_owned(),
+        copied: vec![PathBuf::from(".env")],
+        linked: vec![PathBuf::from("target")],
+    }
+}
 
 fn task(id: &str, created_at_ms: u64) -> Result<Task, Box<dyn std::error::Error>> {
     let spec = TaskSpec {
@@ -25,7 +37,7 @@ async fn live_tasks_survive_reopening_the_file() -> TestResult {
         let store = Store::open(&path).await?;
         let mut working = task("b-working", 2)?;
         working.transition(TaskState::Agent, 3)?;
-        working.worktree = Some(PathBuf::from("/tmp/fleet/fleet-b-working"));
+        working.worktree = Some(worktree("/tmp/fleet/fleet-b-working"));
         store.insert(&task("a-provisioning", 1)?).await?;
         store.insert(&working).await?;
 
@@ -51,7 +63,7 @@ async fn live_tasks_survive_reopening_the_file() -> TestResult {
     let working = working.ok_or("b-working is missing")?;
     assert_eq!(working.state, TaskState::Agent);
     assert_eq!(
-        working.worktree,
+        working.worktree.map(|wt| wt.path),
         Some(PathBuf::from("/tmp/fleet/fleet-b-working"))
     );
     assert_eq!(store.get(&TaskId::parse("nope")?).await?, None);

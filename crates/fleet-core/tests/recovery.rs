@@ -50,14 +50,14 @@ async fn restart_fails_interrupted_work_and_keeps_its_worktree() -> TestResult {
         store.insert(&agent).await?;
         let created = worktree::create(&config, &checkout, &agent.id, "main").await?;
         agent_path.clone_from(&created.path);
-        agent.worktree = Some(created.path);
+        agent.worktree = Some(created);
         advance(&store, &mut agent, &[TaskState::Agent]).await?;
         commit_file(&agent_path, "work.txt", "half done\n")?;
 
         let mut waiting = task(&checkout, "b-waiting")?;
         store.insert(&waiting).await?;
         let created = worktree::create(&config, &checkout, &waiting.id, "main").await?;
-        waiting.worktree = Some(created.path);
+        waiting.worktree = Some(created);
         advance(&store, &mut waiting, &[TaskState::Agent]).await?;
         waiting.ask("which crate?", 9)?;
         store.update(&waiting).await?;
@@ -66,7 +66,7 @@ async fn restart_fails_interrupted_work_and_keeps_its_worktree() -> TestResult {
         store.insert(&gone).await?;
         let created = worktree::create(&config, &checkout, &gone.id, "main").await?;
         gone_path.clone_from(&created.path);
-        gone.worktree = Some(created.path);
+        gone.worktree = Some(created);
         advance(&store, &mut gone, &[TaskState::Agent, TaskState::Preflight]).await?;
 
         let provisioning = task(&checkout, "d-provisioning")?;

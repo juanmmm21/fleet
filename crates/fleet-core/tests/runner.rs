@@ -393,7 +393,7 @@ esac"#,
         base: "main".to_owned(),
     };
     let mut task = Task::new(TaskId::parse("asks")?, spec, 1)?;
-    task.worktree = Some(fx.worktree.path.clone());
+    task.worktree = Some(fx.worktree.clone());
     store.insert(&task).await?;
     task.transition(TaskState::Agent, 2)?;
     store.update(&task).await?;

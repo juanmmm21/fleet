@@ -70,7 +70,7 @@ fn decide(task: &Task) -> Result<Recovery, RecoveryError> {
     if task.state == TaskState::Failed {
         return Ok(Recovery::Kept);
     }
-    if let Some(path) = &task.worktree {
+    if let Some(path) = task.worktree.as_ref().map(|worktree| &worktree.path) {
         // Una sola llamada a `stat`: no compensa mandarla a otro hilo
         let exists = path.try_exists().map_err(|source| RecoveryError::Io {
             path: path.clone(),
