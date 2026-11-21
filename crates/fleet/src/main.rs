@@ -1,25 +1,38 @@
-//! Binario `fleet`: the fleet command-line client.
+//! Binario `fleet`: la CLI de fleet.
 #![forbid(unsafe_code)]
 
+use std::io::Write;
 use std::process::ExitCode;
 
-use fleet_core::cli::{BasicCommand, parse_basic};
-
-const USAGE: &str = "usage: fleet [--version | --help]";
+use fleet::args::{self, USAGE};
+use fleet::client::{Client, DEFAULT_URL};
+use fleet::execute;
 
 fn main() -> ExitCode {
-    match parse_basic(std::env::args().skip(1)) {
-        Ok(BasicCommand::Version) => {
-            println!("{}", fleet_core::version_line("fleet"));
-            ExitCode::SUCCESS
-        }
-        Ok(BasicCommand::Help) => {
-            println!("fleet — the fleet command-line client\n\n{USAGE}");
-            ExitCode::SUCCESS
-        }
+    let command = match args::parse(std::env::args().skip(1)) {
+        Ok(command) => command,
         Err(err) => {
-            eprintln!("fleet: {err}\n{USAGE}");
-            ExitCode::from(2)
+            eprintln!("fleet: {err}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let url = std::env::var("FLEET_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_URL.to_owned());
+    let client = Client::new(&url);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let result = execute(command, &client, &mut out);
+    if let Err(err) = out.flush() {
+        eprintln!("fleet: cannot write the output: {err}");
+        return ExitCode::FAILURE;
+    }
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("fleet: {err}");
+            ExitCode::FAILURE
         }
     }
 }
