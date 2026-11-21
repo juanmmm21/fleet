@@ -313,13 +313,21 @@ async fn patch_shows_committed_and_pending_changes() -> TestResult {
 }
 
 #[tokio::test]
-async fn default_base_comes_from_origin_head() -> TestResult {
+async fn default_base_comes_from_origin_head_or_from_origin_itself() -> TestResult {
     let fx = fixture()?;
     // Un clon recién hecho de un origin con `main` ya trae `origin/HEAD`
     git(fx.dir.path(), &["clone", "--quiet", "origin.git", "fresh"])?;
     let fresh = fx.dir.path().join("fresh");
     assert_eq!(worktree::default_base(&fx.config, &fresh).await?, "main");
+    // Sin `origin/HEAD` se le pregunta al propio `origin`
     git(&fresh, &["remote", "set-head", "origin", "--delete"])?;
+    git(
+        &fx.dir.path().join("origin.git"),
+        &["symbolic-ref", "HEAD", "refs/heads/trunk"],
+    )?;
+    git(&fx.checkout, &["push", "--quiet", "origin", "HEAD:trunk"])?;
+    assert_eq!(worktree::default_base(&fx.config, &fresh).await?, "trunk");
+    git(&fresh, &["remote", "remove", "origin"])?;
     assert!(worktree::default_base(&fx.config, &fresh).await.is_err());
     assert!(matches!(
         worktree::default_base(&fx.config, Path::new("relative")).await,

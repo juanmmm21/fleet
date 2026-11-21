@@ -441,28 +441,36 @@ pub async fn patch(config: &WorktreeConfig, worktree: &Worktree) -> Result<Strin
     Ok(output.stdout)
 }
 
-/// Rama por defecto de `origin` según `refs/remotes/origin/HEAD`, que deja `git clone`.
+/// Rama por defecto de `origin`: la de `refs/remotes/origin/HEAD`, que deja `git clone`, o si
+/// no está (un clon de un `origin` vacío no la tiene), la que diga el propio `origin`.
 pub async fn default_base(config: &WorktreeConfig, repo: &Path) -> Result<String, WorktreeError> {
     if !repo.is_absolute() || !repo.is_dir() {
         return Err(WorktreeError::InvalidRepo(repo.to_path_buf()));
     }
-    let output = git(
-        config,
-        repo,
-        &[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
-    )
-    .await?;
-    let reference = output.stdout.trim();
-    reference
-        .strip_prefix("origin/")
+    let mut local = git_command(repo);
+    local.args([
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ]);
+    let output = process::run(local, config.git_timeout).await?;
+    if output.success()
+        && let Some(base) = output.stdout.trim().strip_prefix("origin/")
+        && !base.is_empty()
+    {
+        return Ok(base.to_owned());
+    }
+    let remote = git(config, repo, &["ls-remote", "--symref", "origin", "HEAD"]).await?;
+    // `ref: refs/heads/main\tHEAD`
+    remote
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("ref: refs/heads/"))
+        .and_then(|rest| rest.split('\t').next())
         .filter(|base| !base.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| WorktreeError::InvalidBase(reference.to_owned()))
+        .ok_or_else(|| WorktreeError::InvalidBase("HEAD".to_owned()))
 }
 
 /// `git diff --name-status -z` sin renombrados: pares `estado\0ruta\0`.
