@@ -7,10 +7,11 @@ pub mod output;
 pub mod tui;
 
 use std::io::{self, Write};
+use std::path::Path;
 
 use args::{Command, RunArgs};
 use client::{Client, ClientError, NewTask};
-use fleet_core::{Task, TaskId};
+use fleet_core::{RepoRef, Task, TaskId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
@@ -83,20 +84,47 @@ pub fn execute(command: Command, client: &Client, out: &mut impl Write) -> Resul
     Ok(())
 }
 
-fn run_task(run: RunArgs, client: &Client, out: &mut impl Write) -> Result<(), CliError> {
-    // El demonio necesita la ruta absoluta y real del checkout
-    let repo = run.repo.canonicalize().map_err(|source| CliError::Repo {
-        path: run.repo.display().to_string(),
+/// Qué repo se manda. En esta máquina, su ruta absoluta y real; para otro nodo, su nombre,
+/// porque allí la carpeta es otra (ADR 0002): el del checkout si existe aquí, o el nombre tal
+/// cual se escribió.
+fn repo_for(repo: &Path, remote: bool) -> Result<String, CliError> {
+    let raw = repo.to_string_lossy().into_owned();
+    if remote && !repo.exists() && RepoRef::parse(&raw).is_ok_and(|r| matches!(r, RepoRef::Name(_)))
+    {
+        return Ok(raw);
+    }
+    let real = repo.canonicalize().map_err(|source| CliError::Repo {
+        path: raw.clone(),
         source,
     })?;
+    if !remote {
+        return Ok(real.to_string_lossy().into_owned());
+    }
+    real.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| CliError::Repo {
+            path: raw,
+            source: io::Error::new(io::ErrorKind::InvalidInput, "the repository has no name"),
+        })
+}
+
+fn run_task(run: RunArgs, client: &Client, out: &mut impl Write) -> Result<(), CliError> {
+    let remote = run.node.is_some() || client.node().is_some();
     let task = client.create(&NewTask {
-        repo,
+        repo: repo_for(&run.repo, remote)?,
         prompt: run.prompt,
         agent: run.agent,
         base: run.base,
+        node: run.node,
     })?;
     if run.json {
         print_json(out, &task)?;
+    } else if remote && client.node() != Some(task.node.as_str()) {
+        writeln!(
+            out,
+            "task {} created on node {} (follow with `FLEET_NODE={} fleet log {} --follow`)",
+            task.id, task.node, task.node, task.id
+        )?;
     } else {
         writeln!(
             out,

@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use fleet_core::{AgentProvider, TaskId};
 
 pub const USAGE: &str = "usage:
-  fleet run <prompt...> [--repo DIR] [--agent claude|agy|ollama[:MODEL]] [--model M] [--base B] [--json]
+  fleet run <prompt...> [--repo DIR|NAME] [--agent claude|agy|ollama[:MODEL]] [--model M] [--base B]
+            [--node NODE|auto] [--json]
   fleet ls [--json]
   fleet show <id> [--json]
   fleet log <id> [--follow]
@@ -15,7 +16,8 @@ pub const USAGE: &str = "usage:
   fleet tui
   fleet --version | --help
 
-FLEET_URL points at fleetd (default http://127.0.0.1:7171).";
+FLEET_URL points at fleetd (default http://127.0.0.1:7171). FLEET_NODE=NODE works with the
+tasks of another node through it. With --node the repo goes by name (~/Desarrollo/<name> there).";
 
 /// Lo que pide la línea de órdenes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,8 @@ pub struct RunArgs {
     pub repo: PathBuf,
     pub agent: AgentProvider,
     pub base: Option<String>,
+    /// Otro nodo o `auto`.
+    pub node: Option<String>,
     pub json: bool,
 }
 
@@ -131,6 +135,7 @@ fn parse_run(rest: Vec<String>) -> Result<RunArgs, ArgsError> {
     let mut agent = "claude".to_owned();
     let mut model = None;
     let mut base = None;
+    let mut node = None;
     let mut json = false;
     let mut args = rest.into_iter();
     while let Some(arg) = args.next() {
@@ -139,6 +144,7 @@ fn parse_run(rest: Vec<String>) -> Result<RunArgs, ArgsError> {
             "--agent" => agent = value(&mut args, "--agent")?,
             "--model" => model = Some(value(&mut args, "--model")?),
             "--base" => base = Some(value(&mut args, "--base")?),
+            "--node" => node = Some(value(&mut args, "--node")?),
             "--json" => json = true,
             "--" => words.extend(args.by_ref()),
             option if option.starts_with("--") => {
@@ -156,6 +162,7 @@ fn parse_run(rest: Vec<String>) -> Result<RunArgs, ArgsError> {
         repo,
         agent: parse_agent(&agent, model)?,
         base,
+        node,
         json,
     })
 }
@@ -231,13 +238,15 @@ mod tests {
     fn run_joins_the_prompt_and_reads_its_options() {
         assert_eq!(
             parse_list(&[
-                "run", "add", "tests", "--repo", "/src/app", "--base", "dev", "--json"
+                "run", "add", "tests", "--repo", "/src/app", "--base", "dev", "--node", "auto",
+                "--json"
             ]),
             Ok(Command::Run(RunArgs {
                 prompt: "add tests".to_owned(),
                 repo: PathBuf::from("/src/app"),
                 agent: AgentProvider::Claude { model: None },
                 base: Some("dev".to_owned()),
+                node: Some("auto".to_owned()),
                 json: true,
             }))
         );

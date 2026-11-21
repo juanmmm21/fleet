@@ -157,6 +157,7 @@ fn run_follow_answer_and_merge_from_the_cli() -> TestResult {
             repo: daemon.checkout(),
             agent: AgentProvider::Claude { model: None },
             base: None,
+            node: None,
             json: true,
         }),
     )?;
@@ -263,9 +264,59 @@ fn api_errors_reach_the_user_with_their_code() -> TestResult {
             repo: daemon.dir.path().join("does-not-exist"),
             agent: AgentProvider::Claude { model: None },
             base: None,
+            node: None,
             json: false,
         }),
     );
     assert!(matches!(err, Err(CliError::Repo { .. })));
+    Ok(())
+}
+
+#[test]
+fn a_node_takes_repos_by_name_and_routes_through_the_local_daemon() -> TestResult {
+    let daemon = daemon()?;
+    // El demonio de prueba se llama «test»: `FLEET_NODE=test` va por /v1/nodes/test/...
+    let client = Client::new(&daemon.url).for_node(Some("test".to_owned()));
+
+    let created = run(
+        &client,
+        Command::Run(RunArgs {
+            prompt: "write it".to_owned(),
+            repo: daemon.checkout(),
+            agent: AgentProvider::Claude { model: None },
+            base: None,
+            node: Some("test".to_owned()),
+            json: true,
+        }),
+    )?;
+    let task: serde_json::Value = serde_json::from_str(&created)?;
+    // Se mandó por nombre y el demonio lo resolvió en su raíz de repos
+    assert_eq!(
+        task["repo"],
+        serde_json::json!(daemon.checkout().canonicalize()?)
+    );
+    let id = TaskId::parse(task["id"].as_str().ok_or("no id")?)?;
+    wait_state(&client, &id, TaskState::Ready)?;
+    let listed = run(&client, Command::List { json: true })?;
+    assert!(listed.contains(id.as_str()), "{listed}");
+
+    // Un nombre que aquí no existe se manda tal cual; uno con barras, no
+    let err = run(
+        &client,
+        Command::Run(RunArgs {
+            prompt: "x".to_owned(),
+            repo: "no-such-repo".into(),
+            agent: AgentProvider::Claude { model: None },
+            base: None,
+            node: Some("test".to_owned()),
+            json: false,
+        }),
+    )
+    .err()
+    .map(|e| e.to_string());
+    assert!(
+        err.is_some_and(|e| !e.contains("cannot use the repository")),
+        "sent by name"
+    );
     Ok(())
 }

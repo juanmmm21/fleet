@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         .ok()
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| DEFAULT_URL.to_owned());
-    let client = Client::new(&url);
+    let client = Client::new(&url).for_node(std::env::var("FLEET_NODE").ok());
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let result = execute(command, &client, &mut out);

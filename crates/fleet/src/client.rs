@@ -1,7 +1,6 @@
 //! Cliente de la API de `fleetd`. La CLI no toca git ni la base de datos: todo va por aquí.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use fleet_core::{AgentProvider, Overlap, Task, TaskId};
@@ -38,11 +37,15 @@ pub enum ClientError {
 /// Lo que se manda para crear una tarea.
 #[derive(Debug, Clone, Serialize)]
 pub struct NewTask {
-    pub repo: PathBuf,
+    /// Ruta absoluta en la máquina del demonio, o nombre del repo (ADR 0002).
+    pub repo: String,
     pub prompt: String,
     pub agent: AgentProvider,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// Otro nodo, o `auto` para que decida el reparto.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 /// Un evento de `GET /v1/events`.
@@ -54,6 +57,8 @@ pub struct StreamEvent {
 
 pub struct Client {
     base: String,
+    /// Con un nodo, todo va por `/v1/nodes/<nodo>/...` del demonio local.
+    node: Option<String>,
     agent: Agent,
     /// Sin plazo de lectura: los eventos pueden tardar en llegar lo que tarde un agente.
     streaming: Agent,
@@ -73,9 +78,15 @@ impl Client {
         };
         Self {
             base,
+            node: None,
             agent: build(Some(CALL_TIMEOUT)),
             streaming: build(None),
         }
+    }
+
+    #[must_use]
+    pub fn node(&self) -> Option<&str> {
+        self.node.as_deref()
     }
 
     #[must_use]
@@ -83,8 +94,18 @@ impl Client {
         &self.base
     }
 
+    /// Habla con las tareas de otro nodo a través del demonio local (`FLEET_NODE`).
+    #[must_use]
+    pub fn for_node(mut self, node: Option<String>) -> Self {
+        self.node = node.filter(|node| !node.is_empty());
+        self
+    }
+
     fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base)
+        match (&self.node, path.strip_prefix("/v1/")) {
+            (Some(node), Some(rest)) => format!("{}/v1/nodes/{node}/{rest}", self.base),
+            _ => format!("{}{path}", self.base),
+        }
     }
 
     fn unreachable(&self, source: ureq::Error) -> ClientError {

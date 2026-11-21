@@ -60,6 +60,9 @@ pub fn task_detail(out: &mut impl Write, task: &Task) -> io::Result<()> {
         task.base
     )?;
     writeln!(out, "branch    {}", task.branch)?;
+    if !task.node.is_empty() {
+        writeln!(out, "node      {}", task.node)?;
+    }
     writeln!(out, "agent     {}", task.agent)?;
     if let Some(worktree) = &task.worktree {
         writeln!(out, "worktree  {}", worktree.path.display())?;
