@@ -97,8 +97,9 @@ fn base36(mut value: u128, width: usize) -> String {
 }
 
 impl fmt::Display for TaskId {
+    // `pad` y no `write_str`: así respeta el ancho de `{:<15}` en las tablas
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -201,7 +202,7 @@ impl TaskState {
 
 impl fmt::Display for TaskState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 

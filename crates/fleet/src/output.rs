@@ -150,6 +150,21 @@ mod tests {
     }
 
     #[test]
+    fn the_table_columns_line_up_whatever_the_state() -> Result<(), Box<dyn std::error::Error>> {
+        let fresh = task("one")?;
+        let mut waiting = task("two")?;
+        waiting.transition(TaskState::Agent, 2)?;
+        waiting.ask("which file?", 3)?;
+        let text = render(|out| task_table(out, &[fresh, waiting]))?;
+        let agent_columns: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.find("claude"))
+            .collect();
+        assert_eq!(agent_columns, [31, 31], "{text}");
+        Ok(())
+    }
+
+    #[test]
     fn the_detail_and_the_resting_line_say_what_to_do() -> Result<(), Box<dyn std::error::Error>> {
         let mut waiting = task("store tasks")?;
         waiting.transition(TaskState::Agent, 2)?;
