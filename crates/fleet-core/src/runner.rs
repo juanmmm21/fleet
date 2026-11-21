@@ -165,7 +165,8 @@ where
 
 /// Lleva a la tarea al estado que toca tras una vuelta del agente: `waiting` si pregunta,
 /// `preflight` si acabó bien y `failed` con el motivo en cualquier otro caso. Guarda la sesión
-/// para poder retomarla. La tarea tiene que estar en `agent`.
+/// para poder retomarla y el diff para ver choques con otras tareas. La tarea tiene que estar
+/// en `agent`.
 pub fn settle(task: &mut Task, report: &AgentReport, now_ms: u64) -> Result<(), TransitionError> {
     if task.state != TaskState::Agent {
         return Err(TransitionError {
@@ -176,6 +177,7 @@ pub fn settle(task: &mut Task, report: &AgentReport, now_ms: u64) -> Result<(), 
     if let Some(session) = &report.summary.session_id {
         task.session_id = Some(session.clone());
     }
+    task.diff = Some(report.diff.clone());
     match failure(report) {
         Some(reason) => task.fail(reason, now_ms),
         None => match report.summary.question() {

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentProvider;
 use crate::preflight::PreflightResult;
+use crate::worktree::Diff;
 
 /// Longitud máxima de un id: va dentro de un nombre de rama y de carpeta.
 const MAX_ID_LEN: usize = 64;
@@ -253,6 +254,9 @@ pub struct Task {
     /// Sesión del agente, para retomarla con la respuesta a su pregunta.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Lo que dejó el agente en su última vuelta respecto a la base: para ver choques.
+    #[serde(default)]
+    pub diff: Option<Diff>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -283,6 +287,7 @@ impl Task {
             question: None,
             preflight: None,
             session_id: None,
+            diff: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         })
