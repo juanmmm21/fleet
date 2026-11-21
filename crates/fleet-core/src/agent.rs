@@ -50,6 +50,10 @@ pub enum AgentProvider {
     },
     /// Un modelo de Ollama en esta máquina; aquí el modelo es obligatorio.
     Ollama { model: String },
+    /// Lo lanza quien crea la tarea, en el worktree que le da fleet, y avisa con `done` al
+    /// acabar (ADR 0003): así un cliente como Palo conserva su propia forma de lanzar el agente
+    /// (sus herramientas, sus preguntas, su control de cupo) y fleet pone el resto.
+    External,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -66,6 +70,8 @@ pub enum AgentError {
     EmptyPrompt,
     #[error("invalid session id `{0}`")]
     InvalidSession(String),
+    #[error("an external agent is run by the client, not by fleet")]
+    External,
 }
 
 /// Dónde están los programas de los agentes en esta máquina.
@@ -104,7 +110,14 @@ impl AgentProvider {
             Self::Claude { .. } => "claude",
             Self::Agy { .. } => "agy",
             Self::Ollama { .. } => "ollama",
+            Self::External => "external",
         }
+    }
+
+    /// Si fleet lanza el agente o lo lanza quien creó la tarea.
+    #[must_use]
+    pub const fn is_external(&self) -> bool {
+        matches!(self, Self::External)
     }
 
     #[must_use]
@@ -112,6 +125,7 @@ impl AgentProvider {
         match self {
             Self::Claude { model } | Self::Agy { model } => model.as_deref(),
             Self::Ollama { model } => Some(model),
+            Self::External => None,
         }
     }
 
@@ -146,6 +160,9 @@ impl AgentProvider {
         resume: Option<&str>,
     ) -> Result<Invocation, AgentError> {
         self.validate()?;
+        if self.is_external() {
+            return Err(AgentError::External);
+        }
         if prompt.trim().is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
@@ -195,6 +212,7 @@ impl AgentProvider {
                 }
                 command
             }
+            Self::External => return Err(AgentError::External),
         };
         let stdin = match resume {
             Some(_) => prompt.to_owned(),
@@ -294,7 +312,22 @@ mod tests {
         );
         assert!(serde_json::from_str::<AgentProvider>(r#"{"kind":"ollama"}"#).is_err());
         assert!(serde_json::from_str::<AgentProvider>(r#"{"kind":"openai"}"#).is_err());
+        let external: AgentProvider = serde_json::from_str(r#"{"kind":"external"}"#)?;
+        assert_eq!(external, AgentProvider::External);
+        assert_eq!(serde_json::to_string(&external)?, r#"{"kind":"external"}"#);
         Ok(())
+    }
+
+    #[test]
+    fn an_external_agent_is_never_launched_by_fleet() {
+        let external = AgentProvider::External;
+        assert!(external.is_external());
+        assert_eq!(external.validate(), Ok(()));
+        assert_eq!(external.to_string(), "external");
+        assert!(matches!(
+            external.invocation(&AgentPrograms::default(), "do it", None),
+            Err(AgentError::External)
+        ));
     }
 
     #[test]

@@ -387,6 +387,7 @@ esac"#,
     };
     let store = Store::open(fx.dir.path().join("fleet.sqlite3")).await?;
     let spec = TaskSpec {
+        client: None,
         repo: fx.worktree.repo.clone(),
         prompt: "store the tasks".to_owned(),
         agent: AgentProvider::Claude { model: None },

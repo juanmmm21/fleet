@@ -13,6 +13,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn task(repo: &std::path::Path, id: &str) -> Result<Task, Box<dyn std::error::Error>> {
     let spec = TaskSpec {
+        client: None,
         repo: repo.to_path_buf(),
         prompt: format!("task {id}"),
         agent: AgentProvider::Claude { model: None },

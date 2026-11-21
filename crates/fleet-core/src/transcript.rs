@@ -85,6 +85,10 @@ impl Transcript {
                 allow_api_key: true,
             },
             AgentProvider::Agy { .. } => Format::Agy,
+            // fleet no lanza nunca un agente externo ni lee su salida; el formato da igual
+            AgentProvider::External => Format::Claude {
+                allow_api_key: false,
+            },
         };
         Self {
             format,

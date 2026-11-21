@@ -20,6 +20,7 @@ fn worktree(path: &str) -> Worktree {
 
 fn task(id: &str, created_at_ms: u64) -> Result<Task, Box<dyn std::error::Error>> {
     let spec = TaskSpec {
+        client: None,
         repo: PathBuf::from("/home/juan/Desarrollo/fleet"),
         prompt: format!("task {id}"),
         agent: AgentProvider::Claude { model: None },

@@ -220,6 +220,23 @@ pub enum NewTaskError {
     EmptyBase,
     #[error("the repository path must be absolute: {0}")]
     RelativeRepo(PathBuf),
+    #[error(
+        "invalid client `{0}`: up to {MAX_CLIENT_LEN} letters, digits or `.`, `_`, `-`, `:`, `/`"
+    )]
+    InvalidClient(String),
+}
+
+/// Largo máximo de [`TaskSpec::client`]: es una etiqueta, no un sitio donde guardar datos.
+pub const MAX_CLIENT_LEN: usize = 64;
+
+/// Una etiqueta que se pueda poner tal cual en una URL de consulta y en un registro.
+#[must_use]
+pub fn is_valid_client(client: &str) -> bool {
+    !client.is_empty()
+        && client.len() <= MAX_CLIENT_LEN
+        && client
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':' | b'/'))
 }
 
 /// Lo que pide quien crea una tarea.
@@ -231,6 +248,10 @@ pub struct TaskSpec {
     pub agent: AgentProvider,
     /// Rama de `origin` de la que sale la tarea y en la que se integra.
     pub base: String,
+    /// Quién la pidió y para qué (p. ej. `palo:<encargo>`), para que un cliente encuentre sus
+    /// tareas tras reiniciarse; fleet no lo interpreta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 /// Una tarea con su estado. Los instantes van en milisegundos Unix.
@@ -260,6 +281,9 @@ pub struct Task {
     /// Lo que dejó el agente en su última vuelta respecto a la base: para ver choques.
     #[serde(default)]
     pub diff: Option<Diff>,
+    /// La etiqueta de quien la pidió ([`TaskSpec::client`]).
+    #[serde(default)]
+    pub client: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -275,6 +299,11 @@ impl Task {
         }
         if !spec.repo.is_absolute() {
             return Err(NewTaskError::RelativeRepo(spec.repo));
+        }
+        if let Some(client) = &spec.client
+            && !is_valid_client(client)
+        {
+            return Err(NewTaskError::InvalidClient(client.clone()));
         }
         let branch = id.branch();
         Ok(Self {
@@ -292,9 +321,19 @@ impl Task {
             preflight: None,
             session_id: None,
             diff: None,
+            client: spec.client,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         })
+    }
+
+    /// El agente externo acabó una vuelta y deja `diff`: la tarea pasa de `agent` al
+    /// pre-flight. Para reintentar desde `failed`, antes hay que volver a `agent` y guardarlo:
+    /// el almacén no acepta saltarse un paso.
+    pub fn hand_over(&mut self, diff: Diff, now_ms: u64) -> Result<(), TransitionError> {
+        self.transition(TaskState::Preflight, now_ms)?;
+        self.diff = Some(diff);
+        Ok(())
     }
 
     /// Cambia de estado si la transición es válida. Al salir de `failed` o de `waiting`
@@ -367,6 +406,7 @@ mod tests {
 
     fn spec() -> TaskSpec {
         TaskSpec {
+            client: None,
             repo: PathBuf::from("/home/juan/Desarrollo/fleet"),
             prompt: "add the task types".to_owned(),
             agent: AgentProvider::Claude { model: None },
@@ -547,5 +587,33 @@ mod tests {
             Task::new(id(), relative, 0),
             Err(NewTaskError::RelativeRepo(PathBuf::from("fleet")))
         );
+        for bad in ["", "two words", "palo;rm", &"x".repeat(MAX_CLIENT_LEN + 1)] {
+            let labelled = TaskSpec {
+                client: Some(bad.to_owned()),
+                ..spec()
+            };
+            assert_eq!(
+                Task::new(id(), labelled, 0),
+                Err(NewTaskError::InvalidClient(bad.to_owned()))
+            );
+        }
+        let labelled = TaskSpec {
+            client: Some("palo:fleet-20261121/1".to_owned()),
+            ..spec()
+        };
+        assert!(Task::new(id(), labelled, 0).is_ok_and(|task| task.client.is_some()));
+    }
+
+    #[test]
+    fn an_external_agent_hands_over_only_while_working() -> Result<(), Box<dyn std::error::Error>> {
+        let mut task = task()?;
+        let diff = Diff::default();
+        assert!(task.hand_over(diff.clone(), 1).is_err());
+        assert_eq!(task.state, TaskState::Provisioning);
+        task.transition(TaskState::Agent, 2)?;
+        task.hand_over(diff.clone(), 3)?;
+        assert_eq!(task.state, TaskState::Preflight);
+        assert_eq!(task.diff, Some(diff));
+        Ok(())
     }
 }

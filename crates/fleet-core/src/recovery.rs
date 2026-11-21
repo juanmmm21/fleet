@@ -12,7 +12,7 @@ use crate::task::{Task, TaskState, TransitionError};
 /// Lo que se hizo con una tarea al arrancar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recovery {
-    /// Sigue igual: esperaba respuesta, estaba lista o ya había fallado.
+    /// Sigue igual: esperaba respuesta, estaba lista, ya había fallado o su agente es externo.
     Kept,
     /// Se cortó a medias (aprovisionando, con el agente o en el pre-flight).
     Interrupted { was: TaskState },
@@ -81,6 +81,8 @@ fn decide(task: &Task) -> Result<Recovery, RecoveryError> {
         }
     }
     Ok(match task.state {
+        // El agente externo no corría dentro de fleetd: sigue trabajando y avisará con `done`
+        TaskState::Agent if task.agent.is_external() => Recovery::Kept,
         TaskState::Provisioning | TaskState::Agent | TaskState::Preflight => {
             Recovery::Interrupted { was: task.state }
         }

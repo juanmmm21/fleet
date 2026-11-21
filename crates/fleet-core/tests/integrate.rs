@@ -232,6 +232,7 @@ async fn two_tasks_on_one_file_integrate_in_order() -> TestResult {
     commit_file(&second_wt.path, "lib.txt", "top\nmiddle\nbottom, second\n")?;
 
     let spec = || TaskSpec {
+        client: None,
         repo: fx.checkout.clone(),
         prompt: "edit lib.txt".to_owned(),
         agent: AgentProvider::Claude { model: None },

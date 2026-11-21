@@ -214,6 +214,7 @@ mod tests {
 
     fn ready_task() -> Result<Task, Box<dyn std::error::Error>> {
         let spec = TaskSpec {
+            client: None,
             repo: PathBuf::from("/repo"),
             prompt: "do it".to_owned(),
             agent: AgentProvider::Claude { model: None },

@@ -99,6 +99,7 @@ mod tests {
         state: TaskState,
     ) -> Result<Task, Box<dyn std::error::Error>> {
         let spec = TaskSpec {
+            client: None,
             repo: PathBuf::from(repo),
             prompt: "x".to_owned(),
             agent: AgentProvider::Claude { model: None },
