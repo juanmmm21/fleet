@@ -101,6 +101,8 @@ pub enum EngineError {
     Busy(TaskId),
     #[error("task {0} is not running")]
     NotRunning(TaskId),
+    #[error("task {0} has no worktree yet")]
+    NoWorktree(TaskId),
     #[error("task {id} touches the same files as {}; integrate those first", join(.waits_for))]
     Blocked { id: TaskId, waits_for: Vec<TaskId> },
     #[error("cannot recover the tasks: {0}")]
@@ -199,6 +201,36 @@ impl Engine {
     /// Pares de tareas vivas que se pisan.
     pub async fn overlaps(&self) -> Result<Vec<Overlap>, EngineError> {
         Ok(overlap::overlaps(&self.inner.store.live().await?))
+    }
+
+    /// Registro de la tarea (agente y pruebas); vacío si aún no ha escrito nada.
+    pub async fn log(&self, id: &TaskId) -> Result<String, EngineError> {
+        self.get(id).await?;
+        let path = self.inner.config.log_path(id);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(err) => Err(EngineError::Invalid(format!(
+                "cannot read {}: {err}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Parche de la tarea contra su base.
+    pub async fn patch(&self, id: &TaskId) -> Result<String, EngineError> {
+        let task = self.get(id).await?;
+        let worktree = task
+            .worktree
+            .ok_or_else(|| EngineError::NoWorktree(id.clone()))?;
+        Ok(worktree::patch(&self.inner.config.worktree, &worktree).await?)
+    }
+
+    /// Rama por defecto del `origin` de `repo`, para las tareas que no dicen otra.
+    pub async fn default_base(&self, repo: &std::path::Path) -> Result<String, EngineError> {
+        worktree::default_base(&self.inner.config.worktree, repo)
+            .await
+            .map_err(|err| EngineError::Invalid(format!("cannot tell the base branch: {err}")))
     }
 
     /// Crea una tarea y lanza su trabajo de fondo.
