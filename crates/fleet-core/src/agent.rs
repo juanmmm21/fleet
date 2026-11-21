@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::transcript::Transcript;
+
 /// Con cualquiera de estas variables Claude Code cobraría por API en vez de usar la suscripción.
 const PAID_ANTHROPIC_ENV: [&str; 2] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 /// Con estas, `agy` podría ir por un proyecto de Google Cloud o una clave de API de pago.
@@ -71,11 +73,13 @@ impl Default for AgentPrograms {
     }
 }
 
-/// Un agente listo para lanzarse: la orden y el encargo, que va por stdin.
+/// Un agente listo para lanzarse: la orden, el encargo (que va por stdin) y el lector de su
+/// salida.
 #[derive(Debug)]
 pub struct Invocation {
     pub command: Command,
     pub stdin: Vec<u8>,
+    pub transcript: Transcript,
 }
 
 impl AgentProvider {
@@ -170,6 +174,7 @@ impl AgentProvider {
         Ok(Invocation {
             command,
             stdin: prompt.as_bytes().to_vec(),
+            transcript: Transcript::for_provider(self),
         })
     }
 }

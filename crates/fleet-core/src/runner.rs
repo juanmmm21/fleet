@@ -8,10 +8,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::agent::Invocation;
 use crate::process::{self, OutputLine, ProcessError, Stream, StreamEnd, StreamOptions};
+use crate::transcript::{AgentSummary, Transcript};
 use crate::worktree::{self, Diff, Worktree, WorktreeConfig, WorktreeError};
 
 /// Líneas en vuelo entre los lectores y el registro antes de frenar al proceso.
@@ -47,6 +48,8 @@ pub struct AgentReport {
     pub output_tail: String,
     /// Lo que hay en el worktree respecto a la base al acabar, aunque se cortara.
     pub diff: Diff,
+    /// Lo que dijo el agente de sí mismo: resultado, sesión, cupo.
+    pub summary: AgentSummary,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,11 +66,12 @@ pub enum RunError {
     },
 }
 
-/// Lanza `command` (el agente ya configurado) dentro del worktree.
+/// Lanza el agente de `invocation` dentro del worktree. Si su salida delata algo que no se
+/// puede consentir (una CLI autenticada con una clave de pago), se corta en el acto.
 pub async fn run_agent<C>(
     worktree_config: &WorktreeConfig,
     worktree: &Worktree,
-    mut command: Command,
+    invocation: Invocation,
     config: &RunConfig,
     log: &Path,
     cancel: C,
@@ -76,6 +80,11 @@ pub async fn run_agent<C>(
 where
     C: Future<Output = ()>,
 {
+    let Invocation {
+        mut command,
+        stdin,
+        transcript,
+    } = invocation;
     command.current_dir(&worktree.path);
     worktree::isolate_git_env(&mut command);
     let program = command
@@ -97,11 +106,35 @@ where
         timeout: config.timeout,
         grace: config.grace,
     };
+    let (abort_tx, abort_rx) = oneshot::channel::<()>();
+    let stop = async move {
+        tokio::select! {
+            () = cancel => {}
+            aborted = abort_rx => {
+                // Si el registro acabó sin pedir el corte, el proceso sigue a lo suyo
+                if aborted.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    };
+    let recorder = Recorder {
+        file,
+        live,
+        tail: Tail::new(config.tail_bytes),
+        transcript,
+        abort: Some(abort_tx),
+    };
     let (streamed, recorded) = tokio::join!(
-        process::stream(command, options, None, cancel, tx),
-        record(rx, file, live, config.tail_bytes)
+        process::stream(command, options, Some(stdin), stop, tx),
+        recorder.run(rx)
     );
-    let (mut file, output_tail, write_result) = recorded;
+    let Recorded {
+        mut file,
+        output_tail,
+        summary,
+        write_result,
+    } = recorded;
     // El fallo del proceso manda: sin él no hay vuelta que registrar
     let output = streamed?;
     write_result.map_err(log_error)?;
@@ -125,6 +158,7 @@ where
         log: log.to_path_buf(),
         output_tail,
         diff,
+        summary,
     })
 }
 
@@ -140,32 +174,62 @@ async fn open_log(path: &Path) -> std::io::Result<BufWriter<File>> {
     Ok(BufWriter::new(file))
 }
 
-/// Escribe cada línea en el registro, guarda el final y la reenvía en directo. Un fallo al
-/// escribir no corta el bucle: hay que seguir vaciando el canal para no frenar al agente.
-async fn record(
-    mut rx: mpsc::Receiver<OutputLine>,
-    mut file: BufWriter<File>,
-    mut live: Option<mpsc::Sender<OutputLine>>,
-    tail_bytes: usize,
-) -> (BufWriter<File>, String, std::io::Result<()>) {
-    let mut tail = Tail::new(tail_bytes);
-    let mut write_result = Ok(());
-    while let Some(line) = rx.recv().await {
-        let text = match line.stream {
-            Stream::Stdout => format!("{}\n", line.line),
-            Stream::Stderr => format!("[stderr] {}\n", line.line),
-        };
-        if write_result.is_ok() {
-            write_result = file.write_all(text.as_bytes()).await;
+struct Recorder {
+    file: BufWriter<File>,
+    live: Option<mpsc::Sender<OutputLine>>,
+    tail: Tail,
+    transcript: Transcript,
+    abort: Option<oneshot::Sender<()>>,
+}
+
+struct Recorded {
+    file: BufWriter<File>,
+    output_tail: String,
+    summary: AgentSummary,
+    write_result: std::io::Result<()>,
+}
+
+impl Recorder {
+    /// Escribe cada línea en el registro, guarda el final, la reenvía en directo y se la pasa
+    /// al lector del agente. Un fallo al escribir no corta el bucle: hay que seguir vaciando el
+    /// canal para no frenar al agente.
+    async fn run(mut self, mut rx: mpsc::Receiver<OutputLine>) -> Recorded {
+        let mut write_result = Ok(());
+        while let Some(line) = rx.recv().await {
+            let text = match line.stream {
+                Stream::Stdout => {
+                    self.transcript.feed(&line.line);
+                    format!("{}\n", line.line)
+                }
+                Stream::Stderr => format!("[stderr] {}\n", line.line),
+            };
+            if write_result.is_ok() {
+                write_result = self.file.write_all(text.as_bytes()).await;
+            }
+            self.tail.push(text);
+            if let Some(reason) = self.transcript.must_stop()
+                && let Some(abort) = self.abort.take()
+            {
+                if write_result.is_ok() {
+                    let note = format!("== fleet stopped the agent: {reason} ==\n");
+                    write_result = self.file.write_all(note.as_bytes()).await;
+                }
+                // Si el proceso ya terminó nadie escucha el corte, y da igual
+                abort.send(()).ok();
+            }
+            if let Some(sender) = &self.live
+                && sender.send(line).await.is_err()
+            {
+                self.live = None;
+            }
         }
-        tail.push(text);
-        if let Some(sender) = &live
-            && sender.send(line).await.is_err()
-        {
-            live = None;
+        Recorded {
+            file: self.file,
+            output_tail: self.tail.into_string(),
+            summary: self.transcript.finish(),
+            write_result,
         }
     }
-    (file, tail.into_string(), write_result)
 }
 
 /// Las últimas líneas que caben en un número de bytes.
