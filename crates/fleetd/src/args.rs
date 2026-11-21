@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "usage: fleetd [--listen 127.0.0.1:7171] [--state-dir DIR] \
                          [--repos-root DIR] [--allow-host NAME]... [--allow-login LOGIN]... \
-                         [--peer URL]... [--gpu] | --version | --help";
+                         [--peer URL]... [--gpu] [--node NAME] | --version | --help";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7171";
 
 /// Qué pide la línea de órdenes.
@@ -30,6 +30,8 @@ pub struct ServeArgs {
     pub peers: Vec<String>,
     /// Esta máquina tiene GPU para Ollama: le tocan las tareas de Ollama en el reparto.
     pub gpu: bool,
+    /// Nombre del nodo si no vale el de la máquina (dos demonios en un equipo, un nombre feo).
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -48,6 +50,8 @@ pub enum ArgsError {
     NoStateDir,
     #[error("cannot find the repos folder: set HOME or pass --repos-root")]
     NoReposRoot,
+    #[error("`{0}` is not a node name (letters, digits, `-`, `_`, `.`; not `auto`)")]
+    BadNode(String),
     #[error("`{0}` is not a peer URL like https://mac.tailnet.ts.net")]
     BadPeer(String),
     #[error("`{0}` is not a Tailscale login")]
@@ -69,6 +73,7 @@ where
     let mut allow_logins = Vec::new();
     let mut peers = Vec::new();
     let mut gpu = false;
+    let mut node = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -88,6 +93,19 @@ where
                 repos_root = Some(PathBuf::from(raw));
             }
             "--gpu" => gpu = true,
+            "--node" => {
+                let name = args.next().ok_or(ArgsError::MissingValue("--node"))?;
+                // Va en rutas (`/v1/nodes/<nodo>/…`) y no puede confundirse con `auto`
+                let valid = !name.is_empty()
+                    && name != "auto"
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+                if !valid {
+                    return Err(ArgsError::BadNode(name));
+                }
+                node = Some(name);
+            }
             "--peer" => {
                 let url = args.next().ok_or(ArgsError::MissingValue("--peer"))?;
                 peers.push(peer_url(url)?);
@@ -132,6 +150,7 @@ where
         allow_logins,
         peers,
         gpu,
+        node,
     }))
 }
 
@@ -204,6 +223,7 @@ mod tests {
                 allow_logins: Vec::new(),
                 peers: Vec::new(),
                 gpu: false,
+                node: None,
             }))
         );
         let xdg = |key: &str| match key {
@@ -240,7 +260,9 @@ mod tests {
                     "friend@example.com",
                     "--peer",
                     "https://mac.tail1234.ts.net/",
-                    "--gpu"
+                    "--gpu",
+                    "--node",
+                    "pc-2"
                 ]),
                 |_| None
             ),
@@ -254,12 +276,19 @@ mod tests {
                 allow_logins: vec!["friend@example.com".to_owned()],
                 peers: vec!["https://mac.tail1234.ts.net".to_owned()],
                 gpu: true,
+                node: Some("pc-2".to_owned()),
             }))
         );
         assert_eq!(
             parse(args(&["--repos-root", "repos"]), home),
             Err(ArgsError::NotAbsolute("repos".to_owned()))
         );
+        for bad in ["auto", "a/b", ""] {
+            assert_eq!(
+                parse(args(&["--node", bad]), home),
+                Err(ArgsError::BadNode(bad.to_owned()))
+            );
+        }
         for bad in ["mac.ts.net", "ftp://mac", "https://mac/v1", "https://"] {
             assert_eq!(
                 parse(args(&["--peer", bad]), home),

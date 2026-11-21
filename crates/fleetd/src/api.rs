@@ -195,7 +195,21 @@ async fn place(state: &AppState, repo: &RepoRef, agent: &AgentProvider) -> ApiRe
     let path = repo.resolve(&state.repos_root);
     // El checkout se mira aquí si existe; en otra máquina estará en el mismo sitio relativo
     let need = placement::need(path.is_dir().then_some(path.as_path()), agent);
-    let online: Vec<NodeCapacity> = nodes_with_load(state)
+    match placement::choose(need, &online_capacity(state).await?) {
+        Ok(node) => Ok(node),
+        Err(_) => {
+            // La lista puede ser de hace unos segundos (un nodo que acaba de arrancar o de
+            // despertar): una vuelta más antes de decir que no hay dónde
+            state.nodes.refresh().await;
+            placement::choose(need, &online_capacity(state).await?).map_err(|err| {
+                ApiError::new(StatusCode::CONFLICT, "no_capable_node", err.to_string())
+            })
+        }
+    }
+}
+
+async fn online_capacity(state: &AppState) -> ApiResult<Vec<NodeCapacity>> {
+    Ok(nodes_with_load(state)
         .await?
         .into_iter()
         .filter(|node| node.online)
@@ -206,9 +220,7 @@ async fn place(state: &AppState, repo: &RepoRef, agent: &AgentProvider) -> ApiRe
             live_tasks: node.live_tasks,
             local: node.local,
         })
-        .collect();
-    placement::choose(need, &online)
-        .map_err(|err| ApiError::new(StatusCode::CONFLICT, "no_capable_node", err.to_string()))
+        .collect())
 }
 
 async fn create_task(State(state): State<AppState>, body: Bytes) -> ApiResult<Response> {

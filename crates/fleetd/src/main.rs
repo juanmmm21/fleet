@@ -50,10 +50,13 @@ fn run(serve_args: ServeArgs) -> anyhow::Result<()> {
 }
 
 async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
-    let node = nix::unistd::gethostname()
-        .context("cannot read the host name")?
-        .to_string_lossy()
-        .into_owned();
+    let node = match &serve_args.node {
+        Some(node) => node.clone(),
+        None => nix::unistd::gethostname()
+            .context("cannot read the host name")?
+            .to_string_lossy()
+            .into_owned(),
+    };
     let mut config = EngineConfig::new(serve_args.state_dir.clone());
     config.node.clone_from(&node);
     let engine = Engine::start(config).await.with_context(|| {

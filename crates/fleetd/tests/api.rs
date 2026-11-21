@@ -299,7 +299,7 @@ async fn serves_the_web_with_relative_paths_and_a_strict_csp() -> TestResult {
     }
     let (status, body) = call(&router, "GET", "/app.js", None).await?;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("new EventSource(API + \"events\")"));
+    assert!(body.contains("new EventSource(apiBase() + \"events\")"));
     assert!(
         !body.contains("innerHTML"),
         "task text must never be parsed as HTML"
