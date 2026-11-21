@@ -1,13 +1,19 @@
 //! Núcleo de fleet: tipos y lógica sin red que comparten el demonio y la CLI.
 #![forbid(unsafe_code)]
 
+// Grupos de procesos, señales y enlaces simbólicos: fleet corre en Linux y macOS.
+#[cfg(not(unix))]
+compile_error!("fleet only supports Unix-like systems (Linux and macOS)");
+
 pub mod agent;
 pub mod cli;
 pub mod preflight;
+pub mod process;
 pub mod task;
 
 pub use agent::{AgentError, AgentProvider};
 pub use preflight::PreflightResult;
+pub use process::{ProcessError, ProcessOutput};
 pub use task::{NewTaskError, Task, TaskId, TaskIdError, TaskSpec, TaskState, TransitionError};
 
 /// Versión de fleet, la misma para los tres crates del workspace.
