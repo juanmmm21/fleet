@@ -1,7 +1,14 @@
 //! Núcleo de fleet: tipos y lógica sin red que comparten el demonio y la CLI.
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod cli;
+pub mod preflight;
+pub mod task;
+
+pub use agent::{AgentError, AgentProvider};
+pub use preflight::PreflightResult;
+pub use task::{NewTaskError, Task, TaskId, TaskIdError, TaskSpec, TaskState, TransitionError};
 
 /// Versión de fleet, la misma para los tres crates del workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
