@@ -4,10 +4,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use fleet_core::TaskId;
 use fleet_core::integrate::{self, IntegrationError, IntegrationOutcome};
+use fleet_core::overlap;
 use fleet_core::preflight::{self, PreflightConfig};
 use fleet_core::worktree::{self, Worktree, WorktreeConfig};
+use fleet_core::{AgentProvider, Task, TaskId, TaskSpec, TaskState};
 use tempfile::TempDir;
 
 mod common;
@@ -216,5 +217,52 @@ async fn uncommitted_work_or_no_commits_is_refused() -> TestResult {
         Err(IntegrationError::Uncommitted(_))
     ));
     assert_eq!(fx.origin_main()?, origin_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_tasks_on_one_file_integrate_in_order() -> TestResult {
+    let fx = fixture()?;
+    commit_file(&fx.checkout, "lib.txt", "top\nmiddle\nbottom\n")?;
+    git(&fx.checkout, &["push", "--quiet", "origin", "HEAD:main"])?;
+
+    let mut first_wt = fx.task().await?;
+    let mut second_wt = fx.task().await?;
+    commit_file(&first_wt.path, "lib.txt", "top, first\nmiddle\nbottom\n")?;
+    commit_file(&second_wt.path, "lib.txt", "top\nmiddle\nbottom, second\n")?;
+
+    let spec = || TaskSpec {
+        repo: fx.checkout.clone(),
+        prompt: "edit lib.txt".to_owned(),
+        agent: AgentProvider::Claude { model: None },
+        base: "main".to_owned(),
+    };
+    let mut tasks = Vec::new();
+    for (id, wt) in [("a-first", &first_wt), ("b-second", &second_wt)] {
+        let mut task = Task::new(TaskId::parse(id)?, spec(), 1)?;
+        for state in [TaskState::Agent, TaskState::Preflight, TaskState::Ready] {
+            task.transition(state, 2)?;
+        }
+        task.diff = Some(worktree::diff(&fx.config, wt).await?);
+        tasks.push(task);
+    }
+
+    let found = overlap::overlaps(&tasks);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].files, ["lib.txt"]);
+    assert!(overlap::waits_for(&tasks[0], &tasks).is_empty());
+    assert_eq!(overlap::waits_for(&tasks[1], &tasks), [tasks[0].id.clone()]);
+
+    let first = run(&fx, &mut first_wt).await?;
+    integrate::settle(&mut tasks[0], &first, 3)?;
+    assert_eq!(tasks[0].state, TaskState::Merged);
+    assert!(overlap::waits_for(&tasks[1], &tasks).is_empty());
+
+    // La segunda se rebasa sobre la primera: el fichero acaba con los dos cambios
+    let second = run(&fx, &mut second_wt).await?;
+    integrate::settle(&mut tasks[1], &second, 4)?;
+    assert_eq!(tasks[1].state, TaskState::Merged);
+    let merged = git(&fx.dir.path().join("origin.git"), &["show", "main:lib.txt"])?;
+    assert_eq!(merged, "top, first\nmiddle\nbottom, second");
     Ok(())
 }
