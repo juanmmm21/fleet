@@ -36,7 +36,11 @@ pub fn commit_file(
     name: &str,
     content: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    std::fs::write(repo.join(name), content)?;
+    let path = repo.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
     git(repo, &["add", name])?;
     git(repo, &["commit", "--quiet", "-m", &format!("add {name}")])?;
     git(repo, &["rev-parse", "HEAD"])
