@@ -8,6 +8,7 @@ compile_error!("fleet only supports Unix-like systems (Linux and macOS)");
 pub mod agent;
 pub mod cli;
 pub mod integrate;
+pub mod overlap;
 pub mod preflight;
 pub mod process;
 pub mod recovery;
@@ -19,6 +20,7 @@ pub mod worktree;
 
 pub use agent::{AgentError, AgentPrograms, AgentProvider, Invocation};
 pub use integrate::{IntegrationError, IntegrationOutcome};
+pub use overlap::Overlap;
 pub use preflight::{ActPlan, PreflightConfig, PreflightError, PreflightPlan, PreflightResult};
 pub use process::{OutputLine, ProcessError, ProcessOutput, Stream, StreamEnd, StreamOptions};
 pub use recovery::{Recovered, Recovery, RecoveryError};
