@@ -255,6 +255,7 @@ mod tests {
         let mut task = ready_task()?;
         let red = PreflightResult {
             command: vec!["cargo".to_owned(), "test".to_owned()],
+            checks: Vec::new(),
             exit_code: Some(101),
             timed_out: false,
             duration_ms: 5,

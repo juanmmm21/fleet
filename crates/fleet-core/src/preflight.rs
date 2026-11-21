@@ -2,6 +2,8 @@
 //!
 //! El comando sale de `fleet.toml` en la raíz del repo o, si no lo hay, de los ficheros que
 //! delatan el stack. Sin ninguno es un error: un repo sin pruebas conocidas nunca da verde.
+//! En Python detectado, tras pytest van `ruff` y `mypy` si el repo los usa: es lo que pasaba
+//! Palo en estos repos antes de delegar en fleet, y sin ellos se perdían al integrar.
 //!
 //! Opcionalmente (`[preflight.act]`), después de las pruebas nativas se repite un job de
 //! GitHub Actions con `act` (ver [`run_act`]).
@@ -9,10 +11,12 @@
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::fs::File;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -27,12 +31,24 @@ const NPM_PLACEHOLDER_TEST: &str = "no test specified";
 const CHANNEL_CAPACITY: usize = 256;
 /// Ficheros que delatan un proyecto de pytest.
 const PYTHON_MARKERS: [&str; 3] = ["pyproject.toml", "pytest.ini", "setup.py"];
+/// El Python del `.venv` del repo: el único que tiene `ruff` y `mypy` instalados.
+const VENV_PYTHON: &str = ".venv/bin/python";
+
+/// Una comprobación del pre-flight: un comando que tiene que salir con 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightCheck {
+    /// Nombre corto para decir cuál falló (`pytest`, `ruff`, `mypy`; `tests` si es una sola).
+    pub name: String,
+    /// Programa y argumentos, relativos a la raíz del worktree.
+    pub command: Vec<String>,
+}
 
 /// Cómo se pasa el pre-flight en un repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreflightPlan {
-    /// Programa y argumentos, relativos a la raíz del worktree.
-    pub command: Vec<String>,
+    /// Se lanzan en orden y la primera que falla corta el resto.
+    pub checks: Vec<PreflightCheck>,
+    /// Plazo para todas las comprobaciones juntas.
     pub timeout: Duration,
     /// De dónde salió: `fleet.toml` o el fichero que delató el stack.
     pub source: String,
@@ -141,7 +157,7 @@ pub fn plan(root: &Path, config: &PreflightConfig) -> Result<PreflightPlan, Pref
             return Err(invalid("preflight.act.job must name a job"));
         }
     }
-    let (source, command, env) = match section.command {
+    let (source, checks, env) = match section.command {
         Some(command) => {
             if command
                 .first()
@@ -149,26 +165,92 @@ pub fn plan(root: &Path, config: &PreflightConfig) -> Result<PreflightPlan, Pref
             {
                 return Err(invalid("preflight.command must name a program"));
             }
-            (CONFIG_FILE.to_owned(), command, Vec::new())
+            (CONFIG_FILE.to_owned(), vec![single(command)], Vec::new())
         }
         None => {
             let (marker, command) =
                 detect(root)?.ok_or_else(|| PreflightError::NoCommand(root.to_path_buf()))?;
-            let env = if PYTHON_MARKERS.contains(&marker) {
-                python_code_env(root)?
+            if PYTHON_MARKERS.contains(&marker) {
+                let mut checks = vec![PreflightCheck {
+                    name: "pytest".to_owned(),
+                    command,
+                }];
+                checks.extend(python_lint_checks(root)?);
+                (marker.to_owned(), checks, python_code_env(root)?)
             } else {
-                Vec::new()
-            };
-            (marker.to_owned(), command, env)
+                (marker.to_owned(), vec![single(command)], Vec::new())
+            }
         }
     };
     Ok(PreflightPlan {
-        command,
+        checks,
         timeout,
         source,
         env,
         act: section.act,
     })
+}
+
+fn single(command: Vec<String>) -> PreflightCheck {
+    PreflightCheck {
+        name: "tests".to_owned(),
+        command,
+    }
+}
+
+/// `ruff check .` y `mypy` con el Python del `.venv` cuando el `pyproject.toml` los nombra,
+/// igual que `_python_checks` de Palo. Sin `.venv` no se añaden: el `python3` del sistema no
+/// suele tenerlos y daría un rojo que no es del código.
+fn python_lint_checks(root: &Path) -> Result<Vec<PreflightCheck>, PreflightError> {
+    if !root.join(VENV_PYTHON).is_file() {
+        return Ok(Vec::new());
+    }
+    let path = root.join("pyproject.toml");
+    let Some(raw) = read_optional(&path)? else {
+        return Ok(Vec::new());
+    };
+    let pyproject: toml::Table = toml::from_str(&raw).map_err(|error| PreflightError::Config {
+        path: path.clone(),
+        message: error.message().to_owned(),
+    })?;
+    let tools = pyproject.get("tool").and_then(toml::Value::as_table);
+    let check = |name: &str, args: &[&str]| PreflightCheck {
+        name: name.to_owned(),
+        command: [VENV_PYTHON, "-m", name]
+            .iter()
+            .chain(args)
+            .map(|&arg| arg.to_owned())
+            .collect(),
+    };
+    // Se busca en todo el texto, no solo en `[tool]`: hay repos que solo lo tienen como
+    // dependencia de desarrollo y lo usan con su configuración por defecto
+    let mut checks = Vec::new();
+    if raw.contains("ruff") {
+        checks.push(check("ruff", &["check", "."]));
+    }
+    if raw.contains("mypy") {
+        let target = mypy_target(tools.and_then(|tools| tools.get("mypy")));
+        if target.is_empty() || root.join("src").is_dir() {
+            checks.push(check("mypy", target));
+        }
+    }
+    Ok(checks)
+}
+
+/// Qué se le pasa a mypy: nada si `[tool.mypy]` trae `files` (el repo dice qué mirar), `src`
+/// si trae configuración sin `files` (el rigor lo pone el repo) y `--strict src` si no hay
+/// `[tool.mypy]`, como en todos los repos de Juan. Sin argumentos ni `files`, mypy no mira nada
+/// y sale con error.
+fn mypy_target(config: Option<&toml::Value>) -> &'static [&'static str] {
+    let Some(config) = config.and_then(toml::Value::as_table) else {
+        return &["--strict", "src"];
+    };
+    let has_files = config.get("files").is_some_and(|files| match files {
+        toml::Value::Array(list) => !list.is_empty(),
+        toml::Value::String(text) => !text.trim().is_empty(),
+        _ => true,
+    });
+    if has_files { &[] } else { &["src"] }
 }
 
 /// El stack por sus ficheros. El `Makefile` va primero: si tiene `test`, es la entrada que el
@@ -200,8 +282,8 @@ fn detect(root: &Path) -> Result<Option<(&'static str, Vec<String>)>, PreflightE
     for marker in PYTHON_MARKERS {
         if root.join(marker).is_file() {
             // El `.venv` del checkout va enlazado en el worktree: su Python tiene las dependencias
-            let python = if root.join(".venv/bin/python").exists() {
-                ".venv/bin/python"
+            let python = if root.join(VENV_PYTHON).exists() {
+                VENV_PYTHON
             } else {
                 "python3"
             };
@@ -247,7 +329,8 @@ fn read_optional(path: &Path) -> Result<Option<String>, PreflightError> {
     }
 }
 
-/// Pasa `plan` en `root` y escribe la salida en `log` (que se amplía, no se pisa).
+/// Pasa `plan` en `root` y escribe la salida en `log` (que se amplía, no se pisa). Las
+/// comprobaciones van en orden y la primera que no pasa es el resultado.
 pub async fn run<C>(
     root: &Path,
     plan: &PreflightPlan,
@@ -258,11 +341,97 @@ pub async fn run<C>(
 where
     C: Future<Output = ()>,
 {
-    let log_error = |source| PreflightError::Io {
+    if plan.checks.is_empty() {
+        return Err(PreflightError::NoCommand(root.to_path_buf()));
+    }
+    let mut recording = Recording {
+        file: open_log(log)
+            .await
+            .map_err(|source| log_error(log, source))?,
+        tail: Tail::new(config.tail_bytes),
+        log,
+    };
+    tokio::pin!(cancel);
+    let started = Instant::now();
+    let chained = plan.checks.len() > 1;
+    let mut names = Vec::new();
+    let mut last = None;
+    for check in &plan.checks {
+        if chained {
+            names.push(check.name.clone());
+        }
+        let remaining = plan.timeout.saturating_sub(started.elapsed());
+        let end = run_check(
+            root,
+            check,
+            plan,
+            remaining,
+            config,
+            &mut recording,
+            cancel.as_mut(),
+        )
+        .await?;
+        let passed = matches!(end, StreamEnd::Exited(Some(0)));
+        last = Some((check, end));
+        if !passed {
+            break;
+        }
+    }
+    let Some((check, end)) = last else {
+        return Err(PreflightError::NoCommand(root.to_path_buf()));
+    };
+    let (exit_code, timed_out) = match end {
+        StreamEnd::Exited(code) => (code, false),
+        StreamEnd::TimedOut => (None, true),
+        StreamEnd::Cancelled => return Err(PreflightError::Cancelled),
+    };
+    let Recording { mut file, tail, .. } = recording;
+    let result = PreflightResult {
+        command: check.command.clone(),
+        checks: names,
+        exit_code,
+        timed_out,
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        output_tail: tail.into_string(),
+    };
+    file.write_all(format!("== {} ==\n", result.summary()).as_bytes())
+        .await
+        .map_err(|source| log_error(log, source))?;
+    file.flush()
+        .await
+        .map_err(|source| log_error(log, source))?;
+    Ok(result)
+}
+
+/// El log del pre-flight y el final de su salida, compartidos por todas las comprobaciones.
+struct Recording<'a> {
+    file: BufWriter<File>,
+    tail: Tail,
+    log: &'a Path,
+}
+
+fn log_error(log: &Path, source: std::io::Error) -> PreflightError {
+    PreflightError::Io {
         path: log.to_path_buf(),
         source,
-    };
-    let (program, args) = plan
+    }
+}
+
+/// Lanza una comprobación con lo que quede de plazo y vuelca su salida en `recording`.
+async fn run_check<C>(
+    root: &Path,
+    check: &PreflightCheck,
+    plan: &PreflightPlan,
+    timeout: Duration,
+    config: &PreflightConfig,
+    recording: &mut Recording<'_>,
+    cancel: Pin<&mut C>,
+) -> Result<StreamEnd, PreflightError>
+where
+    C: Future<Output = ()>,
+{
+    let log = recording.log;
+    let (program, args) = check
         .command
         .split_first()
         .ok_or_else(|| PreflightError::NoCommand(root.to_path_buf()))?;
@@ -281,18 +450,20 @@ where
         .envs(plan.env.iter().map(|(key, value)| (key, value)));
     worktree::isolate_git_env(&mut command);
 
-    let mut file = open_log(log).await.map_err(log_error)?;
-    let label = plan.command.join(" ");
+    let file = &mut recording.file;
+    let tail = &mut recording.tail;
+    let label = check.command.join(" ");
     file.write_all(format!("== preflight `{label}` ({}) ==\n", plan.source).as_bytes())
         .await
-        .map_err(log_error)?;
-    file.flush().await.map_err(log_error)?;
+        .map_err(|source| log_error(log, source))?;
+    file.flush()
+        .await
+        .map_err(|source| log_error(log, source))?;
     let (tx, mut rx) = mpsc::channel::<OutputLine>(CHANNEL_CAPACITY);
     let options = StreamOptions {
-        timeout: plan.timeout,
+        timeout,
         grace: config.grace,
     };
-    let mut tail = Tail::new(config.tail_bytes);
     let record = async {
         let mut result = Ok(());
         while let Some(line) = rx.recv().await {
@@ -314,24 +485,8 @@ where
     let (streamed, recorded) =
         tokio::join!(process::stream(command, options, None, cancel, tx), record);
     let output = streamed?;
-    recorded.map_err(log_error)?;
-    let (exit_code, timed_out) = match output.end {
-        StreamEnd::Exited(code) => (code, false),
-        StreamEnd::TimedOut => (None, true),
-        StreamEnd::Cancelled => return Err(PreflightError::Cancelled),
-    };
-    let result = PreflightResult {
-        command: plan.command.clone(),
-        exit_code,
-        timed_out,
-        duration_ms: u64::try_from(output.duration.as_millis()).unwrap_or(u64::MAX),
-        output_tail: tail.into_string(),
-    };
-    file.write_all(format!("== {} ==\n", result.summary()).as_bytes())
-        .await
-        .map_err(log_error)?;
-    file.flush().await.map_err(log_error)?;
-    Ok(result)
+    recorded.map_err(|source| log_error(log, source))?;
+    Ok(output.end)
 }
 
 /// Repite el job `act.job` de GitHub Actions con `act` sobre lo commiteado en la rama de la
@@ -369,7 +524,10 @@ where
     command.extend(["-j".to_owned(), act.job.clone()]);
     command.extend(act.args.iter().cloned());
     let plan = PreflightPlan {
-        command,
+        checks: vec![PreflightCheck {
+            name: "act".to_owned(),
+            command,
+        }],
         timeout,
         source: format!("act job `{}`", act.job),
         env: Vec::new(),
@@ -405,8 +563,12 @@ async fn remove_clone(path: &Path) -> Result<(), PreflightError> {
 /// Lo que salió de una ejecución del pre-flight.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightResult {
-    /// Programa y argumentos que se lanzaron.
+    /// Programa y argumentos de la comprobación que decide: la que falló o, en verde, la última.
     pub command: Vec<String>,
+    /// Con varias comprobaciones encadenadas (`pytest`, `ruff`, `mypy`), las que se llegaron a
+    /// lanzar, en orden; la última es la de `command`. Vacío con un solo comando.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
     /// Código de salida; `None` si el proceso murió por una señal o se cortó por plazo.
     pub exit_code: Option<i32>,
     pub timed_out: bool,
@@ -425,17 +587,25 @@ impl PreflightResult {
     /// Una línea que explica el resultado, para el motivo de fallo y los avisos.
     #[must_use]
     pub fn summary(&self) -> String {
+        if self.passed() && !self.checks.is_empty() {
+            return format!("{} passed", self.checks.join(", "));
+        }
         let command = self.command.join(" ");
-        if self.timed_out {
-            return format!(
+        let what = if self.timed_out {
+            format!(
                 "`{command}` timed out after {}s",
                 self.duration_ms.div_ceil(1000)
-            );
-        }
-        match self.exit_code {
-            Some(0) => format!("`{command}` passed"),
-            Some(code) => format!("`{command}` exited with code {code}"),
-            None => format!("`{command}` was killed by a signal"),
+            )
+        } else {
+            match self.exit_code {
+                Some(0) => format!("`{command}` passed"),
+                Some(code) => format!("`{command}` exited with code {code}"),
+                None => format!("`{command}` was killed by a signal"),
+            }
+        };
+        match self.checks.last() {
+            Some(check) => format!("{check} failed: {what}"),
+            None => what,
         }
     }
 }
@@ -472,7 +642,7 @@ mod tests {
                 "[preflight]\ncommand = [\"cargo\", \"test\", \"--workspace\"]\ntimeout_secs = 90\n",
             ),
         ])?;
-        assert_eq!(plan.command, ["cargo", "test", "--workspace"]);
+        assert_eq!(plan.checks[0].command, ["cargo", "test", "--workspace"]);
         assert_eq!(plan.timeout, Duration::from_secs(90));
         assert_eq!(plan.source, "fleet.toml");
         Ok(())
@@ -487,7 +657,7 @@ mod tests {
                 "[preflight]\ntimeout_secs = 60\n[preflight.act]\njob = \"test\"\nargs = [\"-P\", \"ubuntu-latest=node:20\"]\n",
             ),
         ])?;
-        assert_eq!(plan.command, ["cargo", "test"]);
+        assert_eq!(plan.checks[0].command, ["cargo", "test"]);
         assert_eq!(plan.source, "Cargo.toml");
         assert_eq!(plan.timeout, Duration::from_secs(60));
         assert_eq!(
@@ -504,7 +674,7 @@ mod tests {
     fn a_fleet_toml_without_preflight_falls_back_to_detection()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = planned(&[("fleet.toml", ""), ("go.mod", "module x")])?;
-        assert_eq!(plan.command, ["go", "test", "./..."]);
+        assert_eq!(plan.checks[0].command, ["go", "test", "./..."]);
         assert_eq!(plan.timeout, PreflightConfig::default().default_timeout);
         Ok(())
     }
@@ -556,7 +726,7 @@ mod tests {
             (&[("Package.swift", "")], &["swift", "test"]),
         ];
         for (files, command) in cases {
-            assert_eq!(planned(files)?.command, command, "{files:?}");
+            assert_eq!(planned(files)?.checks[0].command, command, "{files:?}");
         }
         Ok(())
     }
@@ -589,6 +759,91 @@ mod tests {
         Ok(())
     }
 
+    fn check_names(plan: &PreflightPlan) -> Vec<String> {
+        plan.checks
+            .iter()
+            .map(|check| check.command.join(" "))
+            .collect()
+    }
+
+    #[test]
+    fn python_adds_ruff_and_mypy_when_the_repo_uses_them() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const VENV: (&str, &str) = (".venv/bin/python", "");
+        const SRC: (&str, &str) = ("src/app/__init__.py", "");
+        let pytest = ".venv/bin/python -m pytest";
+        let ruff = ".venv/bin/python -m ruff check .";
+        let cases: [(Files<'_>, &[&str]); 7] = [
+            // Sin `[tool.mypy]`: `--strict src`, como en todos los repos de Juan
+            (
+                &[
+                    (
+                        "pyproject.toml",
+                        "[tool.ruff]\n[dependency-groups]\ndev = [\"mypy\"]\n",
+                    ),
+                    VENV,
+                    SRC,
+                ],
+                &[pytest, ruff, ".venv/bin/python -m mypy --strict src"],
+            ),
+            // `[tool.mypy]` sin `files`: el rigor lo pone el repo
+            (
+                &[
+                    ("pyproject.toml", "[tool.mypy]\nstrict = true\n"),
+                    VENV,
+                    SRC,
+                ],
+                &[pytest, ".venv/bin/python -m mypy src"],
+            ),
+            // Con `files`, mypy sabe qué mirar aunque no haya `src/`
+            (
+                &[("pyproject.toml", "[tool.mypy]\nfiles = [\"app\"]\n"), VENV],
+                &[pytest, ".venv/bin/python -m mypy"],
+            ),
+            // Sin `src/` ni `files`, mypy no tendría qué mirar
+            (
+                &[("pyproject.toml", "[tool.mypy]\nfiles = []\n"), VENV],
+                &[pytest],
+            ),
+            (&[("pyproject.toml", "[tool.mypy]\n"), VENV], &[pytest]),
+            // Sin `.venv` no hay dónde estén instalados
+            (
+                &[("pyproject.toml", "[tool.ruff]\n[tool.mypy]\n"), SRC],
+                &["python3 -m pytest"],
+            ),
+            (
+                &[("pyproject.toml", "[project]\nname = \"app\"\n"), VENV, SRC],
+                &[pytest],
+            ),
+        ];
+        for (files, expected) in cases {
+            assert_eq!(check_names(&planned(files)?), expected, "{files:?}");
+        }
+
+        let named = planned(&[("pyproject.toml", "[tool.ruff]\n[tool.mypy]\n"), VENV, SRC])?;
+        let names: Vec<_> = named
+            .checks
+            .iter()
+            .map(|check| check.name.as_str())
+            .collect();
+        assert_eq!(names, ["pytest", "ruff", "mypy"]);
+
+        let explicit = planned(&[
+            ("pyproject.toml", "[tool.ruff]\n"),
+            VENV,
+            ("fleet.toml", "[preflight]\ncommand = [\"tox\"]\n"),
+        ])?;
+        assert_eq!(check_names(&explicit), ["tox"]);
+
+        let dir = repo(&[("pyproject.toml", "[tool.ruff\n"), VENV])?;
+        let broken = plan(dir.path(), &PreflightConfig::default());
+        assert!(
+            matches!(broken, Err(PreflightError::Config { .. })),
+            "{broken:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn no_known_tests_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
         let placeholder = r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#;
@@ -610,6 +865,7 @@ mod tests {
     fn result(exit_code: Option<i32>, timed_out: bool) -> PreflightResult {
         PreflightResult {
             command: vec!["npm".to_owned(), "test".to_owned()],
+            checks: Vec::new(),
             exit_code,
             timed_out,
             duration_ms: 90_500,
@@ -639,6 +895,27 @@ mod tests {
         assert_eq!(
             result(None, false).summary(),
             "`npm test` was killed by a signal"
+        );
+    }
+
+    #[test]
+    fn chained_summaries_name_the_check() {
+        let chained = |checks: &[&str], exit_code, timed_out| PreflightResult {
+            command: vec!["python".to_owned(), "-m".to_owned(), "mypy".to_owned()],
+            checks: checks.iter().map(|&name| name.to_owned()).collect(),
+            ..result(exit_code, timed_out)
+        };
+        assert_eq!(
+            chained(&["pytest", "ruff", "mypy"], Some(0), false).summary(),
+            "pytest, ruff, mypy passed"
+        );
+        assert_eq!(
+            chained(&["pytest", "ruff", "mypy"], Some(1), false).summary(),
+            "mypy failed: `python -m mypy` exited with code 1"
+        );
+        assert_eq!(
+            chained(&["pytest"], None, true).summary(),
+            "pytest failed: `python -m mypy` timed out after 91s"
         );
     }
 }

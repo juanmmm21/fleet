@@ -167,7 +167,10 @@ function renderDetail() {
   if (task.preflight) {
     const p = task.preflight;
     const result = p.timed_out ? "timed out" : p.exit_code === 0 ? "passed" : `exit ${p.exit_code ?? "signal"}`;
-    preflight.textContent = `Pre-flight: ${p.command.join(" ")} — ${result} in ${(p.duration_ms / 1000).toFixed(1)}s`;
+    const passed = !p.timed_out && p.exit_code === 0;
+    // Con varias comprobaciones encadenadas, en verde se nombran todas y en rojo la que falló
+    const chained = p.checks?.length ? (passed ? `${p.checks.join(", ")}: ` : `${p.checks.at(-1)}: `) : "";
+    preflight.textContent = `Pre-flight: ${chained}${p.command.join(" ")} — ${result} in ${(p.duration_ms / 1000).toFixed(1)}s`;
   }
 
   $("merge").hidden = task.state !== "ready";

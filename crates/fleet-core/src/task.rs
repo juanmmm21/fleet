@@ -422,6 +422,7 @@ mod tests {
     fn preflight(exit_code: Option<i32>, timed_out: bool) -> PreflightResult {
         PreflightResult {
             command: vec!["cargo".to_owned(), "test".to_owned()],
+            checks: Vec::new(),
             exit_code,
             timed_out,
             duration_ms: 1200,

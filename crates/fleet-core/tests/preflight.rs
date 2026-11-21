@@ -259,18 +259,9 @@ async fn a_failing_act_job_is_a_red_preflight() -> TestResult {
     Ok(())
 }
 
-/// Un paquete con layout `src/` instalado en modo editable: el `.venv` del checkout, enlazado en
-/// el worktree, lleva un `.pth` que apunta al `src/` del checkout. En el checkout el código pasa
-/// y en el worktree falla; el pre-flight tiene que ver el del worktree.
-#[tokio::test]
-async fn python_tests_import_the_worktree_code_not_the_editable_checkout() -> TestResult {
-    // El worktree se crea después del `.venv`, que es cuando se enlaza
-    let (dir, _) = worktree_with(&[
-        ("pyproject.toml", "[project]\nname = \"app\"\n"),
-        ("src/app/__init__.py", "OK = True\n"),
-    ])
-    .await?;
-    let checkout = dir.path().join("app");
+/// Un `.venv` sin pip en `checkout`; devuelve su `site-packages`, donde los tests dejan módulos
+/// falsos (`pytest`, `ruff`, `mypy`) que se lanzan con `python -m` igual que los de verdad.
+fn make_venv(checkout: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let venv = checkout.join(".venv");
     let made = std::process::Command::new("python3")
         .args(["-m", "venv", "--without-pip"])
@@ -284,7 +275,105 @@ async fn python_tests_import_the_worktree_code_not_the_editable_checkout() -> Te
         ])
         .output()?;
     assert!(purelib.status.success(), "{purelib:?}");
-    let site = PathBuf::from(String::from_utf8(purelib.stdout)?.trim());
+    Ok(PathBuf::from(String::from_utf8(purelib.stdout)?.trim()))
+}
+
+/// Un módulo `name` que se puede lanzar con `python -m name` y ejecuta `main`.
+fn fake_tool(site: &std::path::Path, name: &str, main: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(site.join(name))?;
+    std::fs::write(site.join(name).join("__init__.py"), "")?;
+    std::fs::write(site.join(name).join("__main__.py"), main)
+}
+
+/// pytest, ruff y mypy van en orden con el Python del `.venv`; el primero que falla corta el
+/// resto y el resultado dice cuál fue.
+#[tokio::test]
+async fn python_chains_ruff_and_mypy_after_pytest() -> TestResult {
+    let pyproject = "[project]\nname = \"app\"\n\n[dependency-groups]\ndev = [\"mypy\"]\n\n[tool.ruff]\nline-length = 100\n";
+    let (dir, wt) =
+        worktree_with(&[("pyproject.toml", pyproject), ("src/app/__init__.py", "")]).await?;
+    let site = make_venv(&wt.path)?;
+    let report = "import os, sys\nprint(NAME, sys.argv[1:], os.environ.get('MYPYPATH'))\nsys.exit(int(os.path.exists(NAME + '.fail')))\n";
+    for name in ["pytest", "ruff", "mypy"] {
+        fake_tool(&site, name, &format!("NAME = '{name}'\n{report}"))?;
+    }
+
+    let plan = preflight::plan(&wt.path, &config())?;
+    let names: Vec<_> = plan
+        .checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect();
+    assert_eq!(names, ["pytest", "ruff", "mypy"]);
+    assert_eq!(
+        plan.checks[2].command,
+        [".venv/bin/python", "-m", "mypy", "--strict", "src"]
+    );
+
+    std::fs::write(wt.path.join("ruff.fail"), "")?;
+    let red = preflight::run(
+        &wt.path,
+        &plan,
+        &config(),
+        &log(&dir),
+        std::future::pending(),
+    )
+    .await?;
+    assert!(!red.passed(), "{red:?}");
+    assert_eq!(red.checks, ["pytest", "ruff"]);
+    assert_eq!(
+        red.command,
+        [".venv/bin/python", "-m", "ruff", "check", "."]
+    );
+    assert_eq!(
+        red.summary(),
+        "ruff failed: `.venv/bin/python -m ruff check .` exited with code 1"
+    );
+    assert!(red.output_tail.contains("pytest []"), "{red:?}");
+    assert!(red.output_tail.contains("ruff ['check', '.']"), "{red:?}");
+    assert!(!red.output_tail.contains("mypy ["), "{red:?}");
+
+    std::fs::remove_file(wt.path.join("ruff.fail"))?;
+    let green = preflight::run(
+        &wt.path,
+        &plan,
+        &config(),
+        &log(&dir),
+        std::future::pending(),
+    )
+    .await?;
+    assert!(green.passed(), "{green:?}");
+    assert_eq!(green.summary(), "pytest, ruff, mypy passed");
+    let mypypath = std::env::join_paths([wt.path.join("src"), wt.path.clone()])?;
+    assert!(
+        green.output_tail.contains(&format!(
+            "mypy ['--strict', 'src'] {}",
+            mypypath.to_string_lossy()
+        )),
+        "{green:?}"
+    );
+    let written = std::fs::read_to_string(log(&dir))?;
+    assert!(written.contains("== ruff failed: "), "{written}");
+    assert!(
+        written.contains("== pytest, ruff, mypy passed =="),
+        "{written}"
+    );
+    Ok(())
+}
+
+/// Un paquete con layout `src/` instalado en modo editable: el `.venv` del checkout, enlazado en
+/// el worktree, lleva un `.pth` que apunta al `src/` del checkout. En el checkout el código pasa
+/// y en el worktree falla; el pre-flight tiene que ver el del worktree.
+#[tokio::test]
+async fn python_tests_import_the_worktree_code_not_the_editable_checkout() -> TestResult {
+    // El worktree se crea después del `.venv`, que es cuando se enlaza
+    let (dir, _) = worktree_with(&[
+        ("pyproject.toml", "[project]\nname = \"app\"\n"),
+        ("src/app/__init__.py", "OK = True\n"),
+    ])
+    .await?;
+    let checkout = dir.path().join("app");
+    let site = make_venv(&checkout)?;
     // Lo que deja `pip install -e .` con un backend moderno
     std::fs::write(
         site.join("_editable_impl_app.pth"),
@@ -308,7 +397,8 @@ async fn python_tests_import_the_worktree_code_not_the_editable_checkout() -> Te
     std::fs::write(wt.path.join("src/app/__init__.py"), "OK = False\n")?;
 
     let plan = preflight::plan(&wt.path, &config())?;
-    assert_eq!(plan.command, [".venv/bin/python", "-m", "pytest"]);
+    assert_eq!(plan.checks.len(), 1);
+    assert_eq!(plan.checks[0].command, [".venv/bin/python", "-m", "pytest"]);
     let in_checkout = preflight::run(
         &checkout,
         &preflight::plan(&checkout, &config())?,
