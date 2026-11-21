@@ -77,6 +77,7 @@ impl Fixture {
 
     pub fn spec(&self, prompt: &str) -> TaskSpec {
         TaskSpec {
+            client: None,
             repo: self.checkout.clone(),
             prompt: prompt.to_owned(),
             agent: AgentProvider::Claude { model: None },

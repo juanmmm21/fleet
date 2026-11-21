@@ -121,6 +121,7 @@ mod tests {
 
     fn task(prompt: &str) -> Result<Task, Box<dyn std::error::Error>> {
         let spec = TaskSpec {
+            client: None,
             repo: PathBuf::from("/home/juan/Desarrollo/fleet"),
             prompt: prompt.to_owned(),
             agent: AgentProvider::Claude { model: None },

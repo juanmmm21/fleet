@@ -256,7 +256,7 @@ fn api_errors_reach_the_user_with_their_code() -> TestResult {
     let err = run(&client, Command::Cancel { id: missing })
         .err()
         .map(|e| e.to_string());
-    assert!(err.is_some_and(|e| e.ends_with("(not_running)")));
+    assert!(err.is_some_and(|e| e.ends_with("(not_found)")));
     let err = run(
         &client,
         Command::Run(RunArgs {

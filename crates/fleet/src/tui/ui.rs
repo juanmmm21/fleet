@@ -128,6 +128,7 @@ mod tests {
     #[test]
     fn shows_tasks_their_state_and_the_question() -> Result<(), Box<dyn std::error::Error>> {
         let spec = TaskSpec {
+            client: None,
             repo: PathBuf::from("/repo"),
             prompt: "store the tasks\nin sqlite".to_owned(),
             agent: AgentProvider::Claude { model: None },

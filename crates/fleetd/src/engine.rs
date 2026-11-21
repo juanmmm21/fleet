@@ -301,14 +301,58 @@ impl Engine {
         Ok(task)
     }
 
-    /// Corta el trabajo de fondo de la tarea; la tarea acaba en `failed` con el motivo.
-    pub fn cancel(&self, id: &TaskId) -> Result<(), EngineError> {
-        let jobs = self.jobs()?;
-        let job = jobs
-            .get(id)
-            .ok_or_else(|| EngineError::NotRunning(id.clone()))?;
-        job.cancel.send_replace(true);
+    /// Corta el trabajo de fondo de la tarea; la tarea acaba en `failed` con el motivo. Una
+    /// tarea externa con su agente trabajando no tiene trabajo de fondo: pasa a `failed` sin
+    /// más, con su rama y su worktree.
+    pub async fn cancel(&self, id: &TaskId) -> Result<(), EngineError> {
+        {
+            let jobs = self.jobs()?;
+            if let Some(job) = jobs.get(id) {
+                job.cancel.send_replace(true);
+                return Ok(());
+            }
+        }
+        self.mutate(id, |task| {
+            if !(task.agent.is_external() && task.state == TaskState::Agent) {
+                return Err(EngineError::NotRunning(task.id.clone()));
+            }
+            task.fail("the external agent was cancelled", now_ms())?;
+            Ok(())
+        })
+        .await?;
         Ok(())
+    }
+
+    /// El agente externo acabó una vuelta en el worktree: se mira lo que dejó y se pasa el
+    /// pre-flight. Vale también desde `failed`, para reintentar tras arreglar un pre-flight rojo.
+    pub async fn done(&self, id: &TaskId) -> Result<Task, EngineError> {
+        let task = self.get(id).await?;
+        if !task.agent.is_external() {
+            return Err(EngineError::Invalid(format!(
+                "task {id} runs its own agent ({}); only external tasks report `done`",
+                task.agent
+            )));
+        }
+        self.wait_idle(id, SETTLE_PATIENCE).await?;
+        let worktree = task
+            .worktree
+            .ok_or_else(|| EngineError::NoWorktree(id.clone()))?;
+        let diff = worktree::diff(&self.inner.config.worktree, &worktree).await?;
+        if task.state == TaskState::Failed {
+            self.mutate(id, |task| {
+                task.transition(TaskState::Agent, now_ms())?;
+                Ok(())
+            })
+            .await?;
+        }
+        let task = self
+            .mutate(id, |task| {
+                task.hand_over(diff.clone(), now_ms())?;
+                Ok(())
+            })
+            .await?;
+        self.spawn(id.clone(), Step::Preflight)?;
+        Ok(task)
     }
 
     /// Integra una tarea `ready` si ninguna más antigua que toque sus ficheros sigue viva.
@@ -502,6 +546,8 @@ impl Engine {
             })
             .await;
         match saved {
+            // El agente externo lo lanza el cliente en el worktree; aquí no queda nada que hacer
+            Ok(task) if task.agent.is_external() => None,
             Ok(task) => Some(Step::Agent {
                 prompt: task.prompt,
                 resume: None,

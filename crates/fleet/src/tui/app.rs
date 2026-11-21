@@ -353,6 +353,7 @@ mod tests {
 
     fn task(id: &str, state: TaskState) -> Result<Task, Box<dyn std::error::Error>> {
         let spec = TaskSpec {
+            client: None,
             repo: PathBuf::from("/repo"),
             prompt: format!("task {id}"),
             agent: AgentProvider::Claude { model: None },

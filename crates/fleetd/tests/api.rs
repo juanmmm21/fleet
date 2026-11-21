@@ -190,8 +190,8 @@ async fn errors_have_a_status_and_a_stable_code() -> TestResult {
             "POST",
             "/v1/tasks/nope/cancel".to_owned(),
             None,
-            StatusCode::CONFLICT,
-            "not_running",
+            StatusCode::NOT_FOUND,
+            "not_found",
         ),
         (
             "GET",
@@ -230,6 +230,12 @@ async fn errors_have_a_status_and_a_stable_code() -> TestResult {
     assert_eq!(
         (status, error_code(&body)),
         (StatusCode::CONFLICT, Some("invalid_transition"))
+    );
+    let (status, body) =
+        call_json(&router, "POST", &format!("/v1/tasks/{id}/cancel"), None).await?;
+    assert_eq!(
+        (status, error_code(&body)),
+        (StatusCode::CONFLICT, Some("not_running"))
     );
     Ok(())
 }
@@ -408,6 +414,119 @@ async fn a_repo_can_be_named_instead_of_a_path() -> TestResult {
         )
         .await?;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(error_code(&body), Some("invalid_request"));
+    }
+    Ok(())
+}
+
+/// Los campos de una tarea son el contrato con los clientes (ADR 0001 y 0003, `docs/api.md`):
+/// dentro de `/v1` solo se añaden, nunca se quitan ni se renombran.
+const TASK_FIELDS: &[&str] = &[
+    "agent",
+    "base",
+    "branch",
+    "client",
+    "created_at_ms",
+    "diff",
+    "failure",
+    "id",
+    "node",
+    "preflight",
+    "prompt",
+    "question",
+    "repo",
+    "session_id",
+    "state",
+    "updated_at_ms",
+    "worktree",
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_runs_its_own_agent_and_finds_its_tasks() -> TestResult {
+    let fx = fixture()?;
+    let (router, engine) = app(&fx).await?;
+    let mut events = engine.subscribe();
+
+    let (status, created) = call_json(
+        &router,
+        "POST",
+        "/v1/tasks",
+        Some(json!({
+            "repo": "app",
+            "prompt": "palo's own agent does this",
+            "agent": { "kind": "external" },
+            "client": "palo:e-7"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let mut fields: Vec<&str> = created
+        .as_object()
+        .ok_or("not an object")?
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, TASK_FIELDS);
+    assert_eq!(created["client"], "palo:e-7");
+    let id = TaskId::parse(created["id"].as_str().ok_or("no id")?)?;
+    let working = wait_for(&mut events, &id, TaskState::Agent).await?;
+    let worktree = working.worktree.ok_or("no worktree")?;
+
+    // Otra tarea de otro cliente no sale en el filtro
+    call_json(
+        &router,
+        "POST",
+        "/v1/tasks",
+        Some(json!({
+            "repo": "app",
+            "prompt": "someone else",
+            "agent": { "kind": "external" },
+            "client": "juan"
+        })),
+    )
+    .await?;
+    let (status, mine) = call_json(&router, "GET", "/v1/tasks?client=palo:e-7", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    let mine = mine.as_array().ok_or("not a list")?;
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0]["id"], id.as_str());
+    let (status, body) = call_json(&router, "GET", "/v1/tasks?owner=palo", None).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), Some("invalid_request"));
+
+    std::fs::write(worktree.path.join("work.txt"), "by palo\n")?;
+    common::git(&worktree.path, &["add", "work.txt"])?;
+    common::git(&worktree.path, &["commit", "--quiet", "-m", "work"])?;
+    let (status, body) = call_json(&router, "POST", &format!("/v1/tasks/{id}/done"), None).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["state"], "preflight");
+    wait_for(&mut events, &id, TaskState::Ready).await?;
+
+    let (status, body) = call_json(&router, "POST", &format!("/v1/tasks/{id}/done"), None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error_code(&body), Some("invalid_transition"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_client_labels_are_refused() -> TestResult {
+    let fx = fixture()?;
+    let (router, _) = app(&fx).await?;
+    for client in ["", "has space", &"x".repeat(65)] {
+        let (status, body) = call_json(
+            &router,
+            "POST",
+            "/v1/tasks",
+            Some(json!({
+                "repo": "app",
+                "prompt": "p",
+                "agent": { "kind": "external" },
+                "client": client
+            })),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{client}: {body}");
         assert_eq!(error_code(&body), Some("invalid_request"));
     }
     Ok(())

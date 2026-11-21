@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -58,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
         .route("/v1/tasks/{id}/merge", post(merge_task))
         .route("/v1/tasks/{id}/drop", post(drop_task))
+        .route("/v1/tasks/{id}/done", post(done_task))
         .route("/v1/overlaps", get(overlaps))
         .route("/v1/events", get(events))
         .merge(web::router())
@@ -174,6 +176,9 @@ struct CreateTask {
     /// Nombre de un nodo o `auto` para que decida el reparto.
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<String>,
+    /// Etiqueta de quien la pide (ADR 0003); viaja tal cual al nodo que la crea.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client: Option<String>,
 }
 
 async fn list_nodes(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeInfo>>> {
@@ -254,6 +259,7 @@ async fn create_task(State(state): State<AppState>, body: Bytes) -> ApiResult<Re
             prompt: request.prompt,
             agent: request.agent,
             base,
+            client: request.client,
         })
         .await?;
     Ok((StatusCode::CREATED, Json(task)).into_response())
@@ -289,8 +295,25 @@ async fn forward_create(state: &AppState, node: &str, body: Bytes) -> Response {
     }
 }
 
-async fn list_tasks(State(state): State<AppState>) -> ApiResult<Response> {
-    Ok(Json(state.engine.list().await?).into_response())
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListFilter {
+    /// Solo las tareas con esta etiqueta de cliente.
+    client: Option<String>,
+}
+
+async fn list_tasks(
+    State(state): State<AppState>,
+    filter: Result<Query<ListFilter>, QueryRejection>,
+) -> ApiResult<Response> {
+    let Query(filter) = filter.map_err(|err| {
+        ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", err.body_text())
+    })?;
+    let mut tasks = state.engine.list().await?;
+    if let Some(client) = &filter.client {
+        tasks.retain(|task| task.client.as_ref() == Some(client));
+    }
+    Ok(Json(tasks).into_response())
 }
 
 async fn get_task(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
@@ -330,7 +353,7 @@ async fn answer_task(
 
 async fn cancel_task(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
     let id = parse_id(&id)?;
-    state.engine.cancel(&id)?;
+    state.engine.cancel(&id).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "cancelling": id }))).into_response())
 }
 
@@ -343,6 +366,13 @@ async fn merge_task(State(state): State<AppState>, Path(id): Path<String>) -> Ap
 async fn drop_task(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
     let id = parse_id(&id)?;
     Ok(Json(state.engine.drop_task(&id).await?).into_response())
+}
+
+/// El agente externo acabó: pre-flight en marcha (ADR 0003).
+async fn done_task(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
+    let id = parse_id(&id)?;
+    let task = state.engine.done(&id).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
 async fn overlaps(State(state): State<AppState>) -> ApiResult<Response> {

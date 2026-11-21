@@ -82,7 +82,7 @@ async fn cancelling_fails_the_task_and_keeps_its_branch() -> TestResult {
             break;
         }
     }
-    engine.cancel(&task.id)?;
+    engine.cancel(&task.id).await?;
     let failed = wait_for(&mut events, &task.id, TaskState::Failed).await?;
     assert_eq!(failed.failure.as_deref(), Some("the agent was cancelled"));
     assert!(failed.worktree.is_some_and(|wt| wt.path.exists()));
@@ -104,7 +104,7 @@ async fn dropping_a_running_task_removes_its_worktree_and_branch() -> TestResult
     assert!(!worktree.path.exists());
     assert!(git(&fx.checkout, &["rev-parse", "--verify", &task.id.branch()]).is_err());
     assert!(matches!(
-        engine.cancel(&task.id),
+        engine.cancel(&task.id).await,
         Err(EngineError::NotRunning(_))
     ));
     Ok(())
@@ -136,6 +136,7 @@ async fn bad_specs_are_rejected_before_anything_runs() -> TestResult {
     let fx = fixture()?;
     let engine = Engine::start(fx.config()?).await?;
     let cloud = TaskSpec {
+        client: None,
         agent: AgentProvider::Ollama {
             model: "big:cloud".to_owned(),
         },
@@ -189,5 +190,84 @@ async fn overlaps_are_announced_again_when_they_end() -> TestResult {
     wait_for_overlaps(&mut events, |count| count == 0).await?;
     assert!(engine.overlaps().await?.is_empty());
     assert!(engine.get(&first.id).await.is_ok());
+    Ok(())
+}
+
+fn external_spec(fx: &common::Fixture) -> TaskSpec {
+    TaskSpec {
+        agent: AgentProvider::External,
+        client: Some("palo:e-1".to_owned()),
+        ..fx.spec("palo runs its own agent here")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_external_agent_works_in_the_worktree_and_reports_done() -> TestResult {
+    let fx = fixture()?;
+    let engine = Engine::start(fx.config()?).await?;
+    let mut events = engine.subscribe();
+
+    let task = engine.create(external_spec(&fx)).await?;
+    let working = wait_for(&mut events, &task.id, TaskState::Agent).await?;
+    assert_eq!(working.client.as_deref(), Some("palo:e-1"));
+    let worktree = working.worktree.ok_or("no worktree")?;
+    // fleet no lanza nada: la tarea se queda esperando al cliente
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(engine.get(&task.id).await?.state, TaskState::Agent);
+    assert!(!worktree.path.join("work.txt").exists());
+
+    // Primera vuelta en rojo: el pre-flight falla y la tarea se puede reintentar
+    std::fs::write(worktree.path.join(".fleet-needs-work"), "")?;
+    engine.done(&task.id).await?;
+    let red = wait_for(&mut events, &task.id, TaskState::Failed).await?;
+    assert!(red.preflight.as_ref().is_some_and(|p| !p.passed()));
+
+    std::fs::remove_file(worktree.path.join(".fleet-needs-work"))?;
+    std::fs::write(worktree.path.join("work.txt"), "by palo\n")?;
+    git(&worktree.path, &["add", "work.txt"])?;
+    git(&worktree.path, &["commit", "--quiet", "-m", "work"])?;
+    engine.done(&task.id).await?;
+    let ready = wait_for(&mut events, &task.id, TaskState::Ready).await?;
+    assert_eq!(ready.diff.as_ref().map(|diff| diff.commits), Some(1));
+    assert!(matches!(
+        engine.done(&task.id).await,
+        Err(EngineError::Transition(_))
+    ));
+
+    engine.merge(&task.id).await?;
+    wait_for(&mut events, &task.id, TaskState::Merged).await?;
+    assert!(fx.origin_has("work.txt")?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_tasks_survive_a_restart_and_can_be_cancelled() -> TestResult {
+    let fx = fixture()?;
+    let config = fx.config()?;
+    let id = {
+        let engine = Engine::start(config.clone()).await?;
+        let mut events = engine.subscribe();
+        let task = engine.create(external_spec(&fx)).await?;
+        wait_for(&mut events, &task.id, TaskState::Agent).await?;
+        task.id
+    };
+    let engine = Engine::start(config).await?;
+    let task = engine.get(&id).await?;
+    assert_eq!(task.state, TaskState::Agent, "{:?}", task.failure);
+
+    engine.cancel(&id).await?;
+    let cancelled = engine.get(&id).await?;
+    assert_eq!(cancelled.state, TaskState::Failed);
+    let worktree = cancelled.worktree.ok_or("no worktree")?;
+    assert!(worktree.path.is_dir());
+    assert!(!git(&fx.checkout, &["branch", "--list", &cancelled.branch])?.is_empty());
+
+    // Un agente propio de fleet no avisa con `done`
+    let own = engine.create(fx.spec("hang forever")).await?;
+    assert!(matches!(
+        engine.done(&own.id).await,
+        Err(EngineError::Invalid(_))
+    ));
+    engine.drop_task(&own.id).await?;
     Ok(())
 }
