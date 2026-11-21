@@ -84,6 +84,7 @@ fn daemon() -> Result<Daemon, Box<dyn std::error::Error>> {
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))?;
     let mut config = EngineConfig::new(dir.path().join("state"));
     config.programs.claude = claude;
+    let repos_root = dir.path().to_path_buf();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -98,6 +99,7 @@ fn daemon() -> Result<Daemon, Box<dyn std::error::Error>> {
             node: "test".to_owned(),
             shutdown,
             hosts: fleetd::guard::HostPolicy::default(),
+            repos_root: repos_root.clone(),
         });
         tokio::spawn(async move {
             // El emisor vive lo que el servidor: soltarlo no cierra los flujos de eventos

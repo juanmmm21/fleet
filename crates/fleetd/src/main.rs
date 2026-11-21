@@ -90,6 +90,7 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
         hosts: HostPolicy {
             extra: serve_args.allow_hosts.clone(),
         },
+        repos_root: serve_args.repos_root.clone(),
     };
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(shutdown)

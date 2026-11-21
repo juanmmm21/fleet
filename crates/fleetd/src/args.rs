@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 pub const USAGE: &str = "usage: fleetd [--listen 127.0.0.1:7171] [--state-dir DIR] \
-                         [--allow-host NAME]... | --version | --help";
+                         [--repos-root DIR] [--allow-host NAME]... | --version | --help";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7171";
 
 /// Qué pide la línea de órdenes.
@@ -19,6 +19,8 @@ pub enum Command {
 pub struct ServeArgs {
     pub listen: SocketAddr,
     pub state_dir: PathBuf,
+    /// Dónde se buscan los repos pedidos por nombre; por defecto `~/Desarrollo`.
+    pub repos_root: PathBuf,
     /// Nombres de máquina aceptados en `Host` además de loopback y `*.ts.net`.
     pub allow_hosts: Vec<String>,
 }
@@ -37,6 +39,10 @@ pub enum ArgsError {
     BadHost(String),
     #[error("cannot find a state folder: set XDG_STATE_HOME or HOME, or pass --state-dir")]
     NoStateDir,
+    #[error("cannot find the repos folder: set HOME or pass --repos-root")]
+    NoReposRoot,
+    #[error("`{0}` must be an absolute path")]
+    NotAbsolute(String),
 }
 
 /// Lee los argumentos. `env` da las variables de entorno (inyectable para los tests).
@@ -48,6 +54,7 @@ where
     let mut listen = None;
     let mut state_dir = None;
     let mut allow_hosts = Vec::new();
+    let mut repos_root = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -58,6 +65,13 @@ where
                 state_dir = Some(PathBuf::from(
                     args.next().ok_or(ArgsError::MissingValue("--state-dir"))?,
                 ));
+            }
+            "--repos-root" => {
+                let raw = args.next().ok_or(ArgsError::MissingValue("--repos-root"))?;
+                if !raw.starts_with('/') {
+                    return Err(ArgsError::NotAbsolute(raw));
+                }
+                repos_root = Some(PathBuf::from(raw));
             }
             "--allow-host" => {
                 let host = args.next().ok_or(ArgsError::MissingValue("--allow-host"))?;
@@ -75,9 +89,17 @@ where
         Some(dir) => dir,
         None => default_state_dir(&env)?,
     };
+    let repos_root = match repos_root {
+        Some(root) => root,
+        None => env("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| PathBuf::from(home).join("Desarrollo"))
+            .ok_or(ArgsError::NoReposRoot)?,
+    };
     Ok(Command::Serve(ServeArgs {
         listen,
         state_dir,
+        repos_root,
         allow_hosts,
     }))
 }
@@ -127,15 +149,23 @@ mod tests {
             Ok(Command::Serve(ServeArgs {
                 listen: SocketAddr::from(([127, 0, 0, 1], 7171)),
                 state_dir: PathBuf::from("/home/juan/.local/state/fleet"),
+                repos_root: PathBuf::from("/home/juan/Desarrollo"),
                 allow_hosts: Vec::new(),
             }))
         );
-        let xdg = |key: &str| (key == "XDG_STATE_HOME").then(|| "/state".to_owned());
+        let xdg = |key: &str| match key {
+            "XDG_STATE_HOME" => Some("/state".to_owned()),
+            _ => home(key),
+        };
         assert!(matches!(
             parse(args(&[]), xdg),
             Ok(Command::Serve(ServeArgs { state_dir, .. })) if state_dir.as_path() == std::path::Path::new("/state/fleet")
         ));
         assert_eq!(parse(args(&[]), |_| None), Err(ArgsError::NoStateDir));
+        assert_eq!(
+            parse(args(&["--state-dir", "/s"]), |_| None),
+            Err(ArgsError::NoReposRoot)
+        );
     }
 
     #[test]
@@ -147,6 +177,8 @@ mod tests {
                     "[::1]:9000",
                     "--state-dir",
                     "/tmp/fleet",
+                    "--repos-root",
+                    "/srv/repos",
                     "--allow-host",
                     "PC",
                     "--allow-host",
@@ -159,8 +191,13 @@ mod tests {
                     .parse()
                     .unwrap_or_else(|_| SocketAddr::from(([0; 4], 0))),
                 state_dir: PathBuf::from("/tmp/fleet"),
+                repos_root: PathBuf::from("/srv/repos"),
                 allow_hosts: vec!["pc".to_owned(), "mac.local".to_owned()],
             }))
+        );
+        assert_eq!(
+            parse(args(&["--repos-root", "repos"]), home),
+            Err(ArgsError::NotAbsolute("repos".to_owned()))
         );
         for bad in ["http://pc", "pc:7171", ""] {
             assert_eq!(

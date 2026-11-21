@@ -24,6 +24,7 @@ async fn app(fx: &Fixture) -> Result<(Router, Engine), Box<dyn std::error::Error
         node: "pc".to_owned(),
         shutdown,
         hosts: fleetd::guard::HostPolicy::default(),
+        repos_root: fx.dir.path().to_path_buf(),
     });
     Ok((router, engine))
 }
@@ -364,5 +365,43 @@ async fn other_websites_cannot_drive_the_daemon() -> TestResult {
     )
     .await?;
     assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repo_can_be_named_instead_of_a_path() -> TestResult {
+    let fx = fixture()?;
+    let (router, engine) = app(&fx).await?;
+    let mut events = engine.subscribe();
+    let name = fx
+        .checkout
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("checkout without a name")?
+        .to_owned();
+    let (status, body) = call_json(
+        &router,
+        "POST",
+        "/v1/tasks",
+        Some(json!({ "repo": name, "prompt": "by name", "agent": { "kind": "claude" } })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // Guarda la ruta ya resuelta, la de verdad en esta máquina
+    assert_eq!(body["repo"], json!(fx.checkout));
+    let id = TaskId::parse(body["id"].as_str().ok_or("no id")?)?;
+    wait_for(&mut events, &id, TaskState::Ready).await?;
+
+    for bad in ["../app", "a/b", ""] {
+        let (status, body) = call_json(
+            &router,
+            "POST",
+            "/v1/tasks",
+            Some(json!({ "repo": bad, "prompt": "x", "agent": { "kind": "claude" } })),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(error_code(&body), Some("invalid_request"));
+    }
     Ok(())
 }

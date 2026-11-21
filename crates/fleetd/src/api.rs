@@ -12,7 +12,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use fleet_core::{AgentProvider, TaskId, TaskSpec};
+use fleet_core::{AgentProvider, RepoRef, TaskId, TaskSpec};
 use futures_util::stream::{self, Stream};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -35,6 +35,8 @@ pub struct AppState {
     pub shutdown: watch::Receiver<bool>,
     /// Qué `Host` se aceptan (ver [`crate::guard`]).
     pub hosts: HostPolicy,
+    /// Dónde están los repos que se piden por nombre (ADR 0002).
+    pub repos_root: PathBuf,
 }
 
 /// La API, la web y por delante la defensa frente a otras webs del navegador.
@@ -126,7 +128,7 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateTask {
-    repo: PathBuf,
+    repo: RepoRef,
     prompt: String,
     agent: AgentProvider,
     base: Option<String>,
@@ -148,14 +150,15 @@ async fn create_task(State(state): State<AppState>, body: Bytes) -> ApiResult<Re
             ),
         ));
     }
+    let repo = request.repo.resolve(&state.repos_root);
     let base = match request.base {
         Some(base) => base,
-        None => state.engine.default_base(&request.repo).await?,
+        None => state.engine.default_base(&repo).await?,
     };
     let task = state
         .engine
         .create(TaskSpec {
-            repo: request.repo,
+            repo,
             prompt: request.prompt,
             agent: request.agent,
             base,
