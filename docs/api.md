@@ -137,7 +137,7 @@ Creating a task:
 
 ### Repository settings
 
-The pre-flight runs the repository's own tests. fleet detects a `Makefile` with a `test` target, Cargo, npm, pytest and Go; otherwise, or to override, add a `fleet.toml` to the repository:
+The pre-flight runs the repository's own tests. fleet detects a `Makefile` with a `test` target, Cargo, npm, pytest and Go. Detected pytest projects run with `PYTHONPATH` and `MYPYPATH` pointing at the worktree's `src/` (if any) and its root, ahead of an editable install in the linked `.venv`. Otherwise, or to override, add a `fleet.toml` to the repository:
 
 ```toml
 [preflight]

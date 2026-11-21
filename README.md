@@ -145,7 +145,7 @@ The web view is served by the daemon at `http://127.0.0.1:7171/`. It shows the s
 
 ### Telling fleet how to test a repository
 
-fleet detects a `Makefile` with a `test` target, `Cargo.toml`, `package.json` with a real test script, pytest projects, `go.mod` and `Package.swift`. To be explicit, or to replay a CI job with `act` after the native tests pass, add a `fleet.toml` at the root of the repository:
+fleet detects a `Makefile` with a `test` target, `Cargo.toml`, `package.json` with a real test script, pytest projects, `go.mod` and `Package.swift`. Detected pytest projects run with `PYTHONPATH` and `MYPYPATH` set to the worktree's `src/` (if any) and its root, so a package installed in editable mode in the linked `.venv` is tested from the task's code, not from your checkout. To be explicit, or to replay a CI job with `act` after the native tests pass, add a `fleet.toml` at the root of the repository:
 
 ```toml
 [preflight]
