@@ -43,6 +43,21 @@ pub struct AgentSummary {
     pub refused: Option<String>,
 }
 
+/// Con qué empieza el último mensaje del agente cuando pregunta algo (ver `agent::PREAMBLE`).
+const QUESTION_PREFIX: &str = "QUESTION:";
+
+impl AgentSummary {
+    /// La pregunta del agente, si acabó con una.
+    #[must_use]
+    pub fn question(&self) -> Option<&str> {
+        let Some(AgentOutcome::Success { text }) = &self.outcome else {
+            return None;
+        };
+        let question = text.trim_start().strip_prefix(QUESTION_PREFIX)?.trim();
+        (!question.is_empty()).then_some(question)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
     /// `allow_api_key`: con Ollama, Claude Code usa una clave de mentira contra la API local.
@@ -300,6 +315,33 @@ mod tests {
         let summary = t.finish();
         assert!(summary.quota_exhausted);
         assert_eq!(summary.session_id.as_deref(), Some("c-1"));
+    }
+
+    #[test]
+    fn a_final_message_starting_with_question_is_a_question() {
+        let summary = |text: &str| AgentSummary {
+            outcome: Some(AgentOutcome::Success {
+                text: text.to_owned(),
+            }),
+            ..AgentSummary::default()
+        };
+        assert_eq!(
+            summary("QUESTION: which crate?").question(),
+            Some("which crate?")
+        );
+        assert_eq!(
+            summary("  QUESTION:\n  sqlite or files? ").question(),
+            Some("sqlite or files?")
+        );
+        assert_eq!(summary("QUESTION:   ").question(), None);
+        assert_eq!(summary("Done. QUESTION: none").question(), None);
+        let error = AgentSummary {
+            outcome: Some(AgentOutcome::Error {
+                message: "QUESTION: x".to_owned(),
+            }),
+            ..AgentSummary::default()
+        };
+        assert_eq!(error.question(), None);
     }
 
     #[test]

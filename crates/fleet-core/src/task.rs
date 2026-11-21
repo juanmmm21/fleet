@@ -250,6 +250,9 @@ pub struct Task {
     pub question: Option<String>,
     /// Último pre-flight pasado en el worktree.
     pub preflight: Option<PreflightResult>,
+    /// Sesión del agente, para retomarla con la respuesta a su pregunta.
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -279,6 +282,7 @@ impl Task {
             failure: None,
             question: None,
             preflight: None,
+            session_id: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         })
