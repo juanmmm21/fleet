@@ -321,8 +321,10 @@ async fn forward_lines<R: AsyncRead + Unpin>(
 
 fn kill_group(group: i32, signal: Signal) -> Result<(), Errno> {
     match killpg(Pid::from_raw(group), signal) {
-        // ESRCH: el grupo ya no existe, que es justo lo que se quería
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        // ESRCH: el grupo ya no existe, que es justo lo que se quería. EPERM: en macOS, si algún
+        // miembro del grupo no puede recibir la señal (un zombi sin recoger), aunque al resto sí
+        // le llegue (kill(2) de macOS); son hijos nuestros, así que no es un problema de permisos
+        Ok(()) | Err(Errno::ESRCH | Errno::EPERM) => Ok(()),
         Err(errno) => Err(errno),
     }
 }
