@@ -77,21 +77,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
             app.selected_diff().unwrap_or("no diff yet").to_owned(),
         ),
     };
-    // Se ve el final: es donde está lo último que hizo el agente
-    let height = usize::from(detail_area.height.saturating_sub(2));
-    let total = text.lines().count();
-    let scroll = u16::try_from(total.saturating_sub(height)).unwrap_or(u16::MAX);
     let detail = Paragraph::new(text)
         .block(Block::bordered().title(title))
-        .scroll((
-            if app.view() == View::Output {
-                scroll
-            } else {
-                0
-            },
-            0,
-        ))
         .wrap(Wrap { trim: false });
+    // Se ve el final, que es donde está lo último que hizo el agente. Se cuentan las líneas ya
+    // partidas al ancho del panel: con las del texto, una salida de líneas largas se corta antes
+    let scroll = if app.view() == View::Output {
+        let total = detail.line_count(detail_area.width.saturating_sub(2));
+        u16::try_from(total.saturating_sub(usize::from(detail_area.height))).unwrap_or(u16::MAX)
+    } else {
+        0
+    };
+    let detail = detail.scroll((scroll, 0));
     frame.render_widget(detail, detail_area);
 
     let status_line = match app.mode() {
@@ -150,6 +147,26 @@ mod tests {
         assert!(text.contains("QUESTION: which crate?"), "{text}");
         assert!(text.contains("agent line two"), "{text}");
         assert!(!text.contains("unreachable"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn long_wrapped_output_still_shows_its_last_line() -> Result<(), Box<dyn std::error::Error>> {
+        let spec = TaskSpec {
+            client: None,
+            repo: PathBuf::from("/repo"),
+            prompt: "run the tests".to_owned(),
+            agent: AgentProvider::Claude { model: None },
+            base: "main".to_owned(),
+        };
+        let id = TaskId::parse("mi3x-0a1b")?;
+        let mut app = App::new();
+        app.set_tasks(vec![Task::new(id.clone(), spec, 1)?]);
+        let long = "x".repeat(120);
+        let log = format!("{long}\n{long}\n{long}\n{long}\nthe last line");
+        app.set_log(id, &log);
+        let text = screen(&app)?;
+        assert!(text.contains("the last line"), "{text}");
         Ok(())
     }
 

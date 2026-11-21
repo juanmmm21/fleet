@@ -14,7 +14,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
-ratatui.workspace = true
+# `line_count` cuenta las líneas ya partidas: sin él, el final de una salida larga no se ve
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 
 [dev-dependencies]
 fleetd.workspace = true
