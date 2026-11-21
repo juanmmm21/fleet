@@ -25,7 +25,9 @@ async fn start(
     name: &str,
     peers: Vec<String>,
 ) -> Result<Node, Box<dyn std::error::Error>> {
-    let engine = Engine::start(fx.config()?).await?;
+    let mut config = fx.config()?;
+    config.node = name.to_owned();
+    let engine = Engine::start(config).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     let (stop, shutdown) = watch::channel(false);
@@ -113,6 +115,7 @@ async fn one_node_drives_another_through_its_api() -> TestResult {
     .await?;
     assert_eq!(status, 201, "{task}");
     assert_eq!(task["repo"], json!(mac_fx.checkout));
+    assert_eq!(task["node"], json!("mac"));
     let id = TaskId::parse(task["id"].as_str().ok_or("no id")?)?;
     wait_for(&mut mac_events, &id, TaskState::Ready).await?;
     assert!(

@@ -50,18 +50,18 @@ fn run(serve_args: ServeArgs) -> anyhow::Result<()> {
 }
 
 async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
-    let engine = Engine::start(EngineConfig::new(serve_args.state_dir.clone()))
-        .await
-        .with_context(|| {
-            format!(
-                "cannot open the state in {}",
-                serve_args.state_dir.display()
-            )
-        })?;
     let node = nix::unistd::gethostname()
         .context("cannot read the host name")?
         .to_string_lossy()
         .into_owned();
+    let mut config = EngineConfig::new(serve_args.state_dir.clone());
+    config.node.clone_from(&node);
+    let engine = Engine::start(config).await.with_context(|| {
+        format!(
+            "cannot open the state in {}",
+            serve_args.state_dir.display()
+        )
+    })?;
     let logins = tailnet_logins(&serve_args).await;
     let nodes = Nodes::new(NodesConfig {
         local: node.clone(),

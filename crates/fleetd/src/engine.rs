@@ -39,6 +39,8 @@ pub struct EngineConfig {
     pub run: RunConfig,
     pub preflight: PreflightConfig,
     pub worktree: WorktreeConfig,
+    /// Nombre de este nodo, que se apunta en cada tarea nueva.
+    pub node: String,
 }
 
 impl EngineConfig {
@@ -50,6 +52,7 @@ impl EngineConfig {
             programs: AgentPrograms::default(),
             run: RunConfig::default(),
             preflight: PreflightConfig::default(),
+            node: "local".to_owned(),
         }
     }
 
@@ -239,8 +242,9 @@ impl Engine {
             .validate()
             .map_err(|err| EngineError::Invalid(err.to_string()))?;
         let now = now_ms();
-        let task = Task::new(TaskId::generate(SystemTime::now()), spec, now)
+        let mut task = Task::new(TaskId::generate(SystemTime::now()), spec, now)
             .map_err(|err| EngineError::Invalid(err.to_string()))?;
+        task.node.clone_from(&self.inner.config.node);
         {
             let _guard = self.inner.lock.lock().await;
             self.inner.store.insert(&task).await?;

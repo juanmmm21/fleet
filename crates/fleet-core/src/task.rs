@@ -242,6 +242,9 @@ pub struct Task {
     pub agent: AgentProvider,
     pub base: String,
     pub branch: String,
+    /// Nodo donde corre (ADR 0002); vacío en tareas guardadas antes de que hubiera varios.
+    #[serde(default)]
+    pub node: String,
     /// El worktree, cuando ya existe: carpeta, rama y commit del que salió.
     pub worktree: Option<Worktree>,
     pub state: TaskState,
@@ -281,6 +284,7 @@ impl Task {
             agent: spec.agent,
             base: spec.base,
             branch,
+            node: String::new(),
             worktree: None,
             state: TaskState::Provisioning,
             failure: None,
