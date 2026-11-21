@@ -15,7 +15,7 @@ pub mod store;
 pub mod task;
 pub mod worktree;
 
-pub use agent::{AgentError, AgentProvider};
+pub use agent::{AgentError, AgentPrograms, AgentProvider, Invocation};
 pub use preflight::PreflightResult;
 pub use process::{OutputLine, ProcessError, ProcessOutput, Stream, StreamEnd, StreamOptions};
 pub use recovery::{Recovered, Recovery, RecoveryError};
