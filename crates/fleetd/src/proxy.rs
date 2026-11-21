@@ -4,7 +4,7 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::{self, StreamExt};
 use tokio::sync::watch;
@@ -59,9 +59,19 @@ fn offline(info: &NodeInfo) -> Response {
     .into_response()
 }
 
-async fn local(router: Router, mut request: Request, path: &str) -> Response {
-    match path.parse::<Uri>() {
-        Ok(uri) => *request.uri_mut() = uri,
+async fn local(router: Router, request: Request, path: &str) -> Response {
+    // Petición nueva y no la misma con otra URI: las extensiones llevan los parámetros de
+    // `/v1/nodes/{node}/{*rest}` y la ruta interna los leería como suyos
+    let (parts, body) = request.into_parts();
+    let mut builder = axum::http::Request::builder()
+        .method(parts.method)
+        .uri(path)
+        .version(parts.version);
+    for (name, value) in &parts.headers {
+        builder = builder.header(name, value);
+    }
+    let fresh = match builder.body(body) {
+        Ok(fresh) => fresh,
         Err(err) => {
             return ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -70,8 +80,8 @@ async fn local(router: Router, mut request: Request, path: &str) -> Response {
             )
             .into_response();
         }
-    }
-    match router.oneshot(request).await {
+    };
+    match router.oneshot(fresh).await {
         Ok(response) => response,
         Err(never) => match never {},
     }

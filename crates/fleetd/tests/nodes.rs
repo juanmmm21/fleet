@@ -176,6 +176,17 @@ async fn one_node_drives_another_through_its_api() -> TestResult {
     )
     .await?;
     assert_eq!((status, health["node"].clone()), (200, json!("pc")));
+    // También rutas con parámetros: no se mezclan con los del reenvío
+    let (status, body) = send(
+        reqwest::Method::GET,
+        &format!("{}/v1/nodes/pc/tasks/{id}", pc.url),
+        None,
+    )
+    .await?;
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (404, json!("not_found"))
+    );
     let (status, body) = send(
         reqwest::Method::GET,
         &format!("{}/v1/nodes/nas/tasks", pc.url),
