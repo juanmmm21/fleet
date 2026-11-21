@@ -10,11 +10,13 @@ pub mod cli;
 pub mod preflight;
 pub mod process;
 pub mod task;
+pub mod worktree;
 
 pub use agent::{AgentError, AgentProvider};
 pub use preflight::PreflightResult;
 pub use process::{ProcessError, ProcessOutput};
 pub use task::{NewTaskError, Task, TaskId, TaskIdError, TaskSpec, TaskState, TransitionError};
+pub use worktree::{Removal, Worktree, WorktreeConfig, WorktreeError};
 
 /// Versión de fleet, la misma para los tres crates del workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
