@@ -14,6 +14,7 @@ pub mod process;
 pub mod recovery;
 pub mod runner;
 pub mod store;
+pub mod tailnet;
 pub mod task;
 pub mod transcript;
 pub mod worktree;
@@ -26,6 +27,7 @@ pub use process::{OutputLine, ProcessError, ProcessOutput, Stream, StreamEnd, St
 pub use recovery::{Recovered, Recovery, RecoveryError};
 pub use runner::{AgentReport, RunConfig, RunError};
 pub use store::{Store, StoreError};
+pub use tailnet::{Machine, TailnetError, TailnetStatus};
 pub use task::{NewTaskError, Task, TaskId, TaskIdError, TaskSpec, TaskState, TransitionError};
 pub use transcript::{AgentOutcome, AgentSummary, Transcript};
 pub use worktree::{
