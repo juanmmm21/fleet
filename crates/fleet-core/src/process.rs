@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
@@ -147,15 +147,18 @@ pub struct StreamOutput {
 }
 
 /// Cuánto se espera a que se vacíen las tuberías una vez muerto el grupo. Solo se alcanza si
-/// un nieto escapó del grupo (`setsid`) y sigue con la tubería abierta.
+/// un nieto escapó del grupo (`setsid`) y sigue con una tubería abierta.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Lanza `command` sin entrada y manda cada línea de su salida a `lines` mientras corre.
+/// Lanza `command` y manda cada línea de su salida a `lines` mientras corre. Con `input`, se le
+/// escribe por stdin y se cierra (los agentes leen así el encargo, sin límites de argv); sin él,
+/// stdin va vacío.
 /// Se corta al vencer el plazo o al completarse `cancel`. Al acabar, por la razón que sea,
 /// se mata lo que quede de su grupo: un agente no deja procesos sueltos.
 pub async fn stream<C>(
     mut command: Command,
     options: StreamOptions,
+    input: Option<Vec<u8>>,
     cancel: C,
     lines: mpsc::Sender<OutputLine>,
 ) -> Result<StreamOutput, ProcessError>
@@ -164,7 +167,11 @@ where
 {
     let program = program_name(command.as_std().get_program());
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
@@ -176,6 +183,11 @@ where
         source,
     })?;
     let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+    let writer = child
+        .stdin
+        .take()
+        .zip(input)
+        .map(|(stdin, input)| tokio::spawn(write_input(stdin, input)));
     let readers = [
         child
             .stdout
@@ -208,6 +220,14 @@ where
             program: program.clone(),
             source,
         })?;
+    }
+    if let Some(writer) = writer {
+        let abort = writer.abort_handle();
+        match tokio::time::timeout(DRAIN_TIMEOUT, writer).await {
+            Ok(Ok(result)) => result.map_err(io_error)?,
+            Ok(Err(join)) => return Err(io_error(io::Error::other(join))),
+            Err(_elapsed) => abort.abort(),
+        }
     }
     for reader in readers.into_iter().flatten() {
         let abort = reader.abort_handle();
@@ -259,6 +279,19 @@ async fn terminate(
             Err(TerminateError::Io(source))
         }
         _ => Ok(()),
+    }
+}
+
+/// Escribe la entrada y cierra stdin. Si el proceso la cierra antes (terminó o no la quería),
+/// no es un fallo de fleet: lo que haya hecho se ve en su salida y su código.
+async fn write_input(mut stdin: tokio::process::ChildStdin, input: Vec<u8>) -> io::Result<()> {
+    match stdin.write_all(&input).await {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error),
+        Ok(()) => match stdin.shutdown().await {
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            result => result,
+        },
     }
 }
 
@@ -385,6 +418,7 @@ mod tests {
         let output = stream(
             sh("printf 'one\\ntwo\\r\\n'; echo oops >&2; printf 'no newline'; exit 2"),
             options(10_000, 1_000),
+            None,
             std::future::pending(),
             tx,
         )
@@ -408,6 +442,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_goes_to_stdin_and_is_closed() -> Result<(), ProcessError> {
+        let (tx, mut rx) = mpsc::channel(8);
+        let output = stream(
+            sh("cat; echo done"),
+            options(10_000, 1_000),
+            Some(b"the prompt\nsecond line".to_vec()),
+            std::future::pending(),
+            tx,
+        )
+        .await?;
+        assert_eq!(output.end, StreamEnd::Exited(Some(0)));
+        let mut lines = Vec::new();
+        while let Some(line) = rx.recv().await {
+            lines.push(line.line);
+        }
+        assert_eq!(lines, ["the prompt", "second linedone"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_process_that_never_reads_its_input_is_fine() -> Result<(), ProcessError> {
+        let (tx, rx) = mpsc::channel(8);
+        drop(rx);
+        let output = stream(
+            sh("exec 0<&-; exit 0"),
+            options(10_000, 1_000),
+            Some(vec![b'x'; 1 << 20]),
+            std::future::pending(),
+            tx,
+        )
+        .await?;
+        assert_eq!(output.end, StreamEnd::Exited(Some(0)));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancelling_sends_sigterm_first() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let marker = dir.path().join("terminated");
@@ -421,6 +491,7 @@ mod tests {
         let run = tokio::spawn(stream(
             sh(&script),
             options(30_000, 5_000),
+            None,
             async move {
                 // Si el emisor se suelta sin avisar, también se cancela
                 let _ = cancel_rx.await;
@@ -446,6 +517,7 @@ mod tests {
         let output = stream(
             sh("trap '' TERM; while true; do sleep 0.1; done"),
             options(300, 300),
+            None,
             std::future::pending(),
             tx,
         )
@@ -462,6 +534,7 @@ mod tests {
         let output = stream(
             sh("i=0; while [ $i -lt 20000 ]; do echo line $i; i=$((i+1)); done"),
             options(20_000, 1_000),
+            None,
             std::future::pending(),
             tx,
         )
@@ -484,6 +557,7 @@ mod tests {
         let output = stream(
             sh(&script),
             options(10_000, 1_000),
+            None,
             std::future::pending(),
             tx,
         )

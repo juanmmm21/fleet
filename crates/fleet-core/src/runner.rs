@@ -98,7 +98,7 @@ where
         grace: config.grace,
     };
     let (streamed, recorded) = tokio::join!(
-        process::stream(command, options, cancel, tx),
+        process::stream(command, options, None, cancel, tx),
         record(rx, file, live, config.tail_bytes)
     );
     let (mut file, output_tail, write_result) = recorded;
