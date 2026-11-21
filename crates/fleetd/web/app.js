@@ -108,6 +108,7 @@ function renderList() {
   for (const task of tasks) {
     const item = el("li");
     item.dataset.id = task.id;
+    item.title = task.prompt;
     if (task.id === state.selected) item.classList.add("selected");
     const badge = el("span", "badge", task.state);
     badge.dataset.state = task.state;
@@ -376,6 +377,12 @@ function wire() {
       loadView();
     });
   }
+
+  // Un enlace a `#<id>` con la página ya abierta (replaceState de `select` no lo dispara)
+  window.addEventListener("hashchange", () => {
+    const wanted = location.hash.slice(1);
+    if (state.tasks.has(wanted) && wanted !== state.selected) select(wanted);
+  });
 
   // Las edades de la lista se quedan viejas aunque no lleguen eventos
   setInterval(renderList, 30000);
