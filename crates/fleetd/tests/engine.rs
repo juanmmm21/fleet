@@ -152,3 +152,42 @@ async fn bad_specs_are_rejected_before_anything_runs() -> TestResult {
     assert!(engine.list().await?.is_empty());
     Ok(())
 }
+
+/// Espera el siguiente evento de choques que cumpla `wanted`.
+async fn wait_for_overlaps(
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    wanted: impl Fn(usize) -> bool,
+) -> TestResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .map_err(|_| "the expected overlaps never came")??;
+        if let Event::Overlaps { overlaps } = event
+            && wanted(overlaps.len())
+        {
+            return Ok(());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overlaps_are_announced_again_when_they_end() -> TestResult {
+    let fx = fixture()?;
+    let engine = Engine::start(fx.config()?).await?;
+    let mut events = engine.subscribe();
+
+    // Las dos escriben `work.txt`
+    let first = engine.create(fx.spec("first")).await?;
+    let second = engine.create(fx.spec("second")).await?;
+    wait_for_overlaps(&mut events, |count| count == 1).await?;
+    wait_for(&mut events, &second.id, TaskState::Ready).await?;
+    assert_eq!(engine.overlaps().await?.len(), 1);
+
+    // Sin la segunda ya no hay choque, y los clientes se enteran con una lista vacía
+    engine.drop_task(&second.id).await?;
+    wait_for_overlaps(&mut events, |count| count == 0).await?;
+    assert!(engine.overlaps().await?.is_empty());
+    assert!(engine.get(&first.id).await.is_ok());
+    Ok(())
+}

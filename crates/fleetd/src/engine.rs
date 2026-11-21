@@ -76,7 +76,7 @@ pub enum Event {
         stream: OutputStream,
         line: String,
     },
-    /// Pares de tareas que tocan los mismos ficheros, tras cambiar el diff de alguna.
+    /// Todos los pares de tareas que tocan los mismos ficheros, cada vez que una cambia de estado.
     Overlaps { overlaps: Vec<Overlap> },
 }
 
@@ -380,7 +380,7 @@ impl Engine {
     where
         F: FnOnce(&mut Task) -> Result<(), EngineError>,
     {
-        let task = {
+        let (before, task) = {
             let _guard = self.inner.lock.lock().await;
             let mut task = self
                 .inner
@@ -388,13 +388,19 @@ impl Engine {
                 .get(id)
                 .await?
                 .ok_or_else(|| EngineError::NotFound(id.clone()))?;
+            let before = task.state;
             change(&mut task)?;
             self.inner.store.update(&task).await?;
-            task
+            (before, task)
         };
         self.emit(Event::Task {
             task: Box::new(task.clone()),
         });
+        // El diff solo cambia al acabar una vuelta del agente, y entrar o salir de `failed`,
+        // `merged` o `dropped` cambia qué tareas cuentan: los choques se recalculan con el estado
+        if before != task.state {
+            self.announce_overlaps().await;
+        }
         Ok(task)
     }
 
@@ -567,10 +573,7 @@ impl Engine {
             })
             .await;
         match settled {
-            Ok(task) => {
-                self.announce_overlaps().await;
-                (task.state == TaskState::Preflight).then_some(Step::Preflight)
-            }
+            Ok(task) => (task.state == TaskState::Preflight).then_some(Step::Preflight),
             Err(err) => {
                 report(id, &format!("abandoned after the agent: {err}"));
                 None
@@ -578,10 +581,10 @@ impl Engine {
         }
     }
 
+    /// Siempre con la lista entera, también vacía: así un cliente sabe que un choque se acabó.
     async fn announce_overlaps(&self) {
         match self.overlaps().await {
-            Ok(overlaps) if !overlaps.is_empty() => self.emit(Event::Overlaps { overlaps }),
-            Ok(_) => {}
+            Ok(overlaps) => self.emit(Event::Overlaps { overlaps }),
             Err(err) => eprintln!("fleetd: cannot compute overlaps: {err}"),
         }
     }
