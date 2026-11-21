@@ -14,6 +14,9 @@ anyhow.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 nix = { workspace = true, features = ["hostname"] }
+reqwest.workspace = true
+rustls.workspace = true
+tower = { workspace = true, features = ["util"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
