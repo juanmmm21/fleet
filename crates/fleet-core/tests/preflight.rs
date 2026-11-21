@@ -258,3 +258,81 @@ async fn a_failing_act_job_is_a_red_preflight() -> TestResult {
     assert_eq!(result.exit_code, Some(1));
     Ok(())
 }
+
+/// Un paquete con layout `src/` instalado en modo editable: el `.venv` del checkout, enlazado en
+/// el worktree, lleva un `.pth` que apunta al `src/` del checkout. En el checkout el código pasa
+/// y en el worktree falla; el pre-flight tiene que ver el del worktree.
+#[tokio::test]
+async fn python_tests_import_the_worktree_code_not_the_editable_checkout() -> TestResult {
+    // El worktree se crea después del `.venv`, que es cuando se enlaza
+    let (dir, _) = worktree_with(&[
+        ("pyproject.toml", "[project]\nname = \"app\"\n"),
+        ("src/app/__init__.py", "OK = True\n"),
+    ])
+    .await?;
+    let checkout = dir.path().join("app");
+    let venv = checkout.join(".venv");
+    let made = std::process::Command::new("python3")
+        .args(["-m", "venv", "--without-pip"])
+        .arg(&venv)
+        .output()?;
+    assert!(made.status.success(), "{made:?}");
+    let purelib = std::process::Command::new(venv.join("bin/python"))
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ])
+        .output()?;
+    assert!(purelib.status.success(), "{purelib:?}");
+    let site = PathBuf::from(String::from_utf8(purelib.stdout)?.trim());
+    // Lo que deja `pip install -e .` con un backend moderno
+    std::fs::write(
+        site.join("_editable_impl_app.pth"),
+        format!("{}\n", checkout.join("src").display()),
+    )?;
+    // Un `pytest` mínimo: solo importa el paquete y sale según lo que encuentra
+    std::fs::create_dir_all(site.join("pytest"))?;
+    std::fs::write(site.join("pytest/__init__.py"), "")?;
+    std::fs::write(
+        site.join("pytest/__main__.py"),
+        "import sys, app\nprint('app from', app.__file__)\nsys.exit(0 if app.OK else 1)\n",
+    )?;
+    let wt = worktree::create(
+        &WorktreeConfig::new(dir.path().join("worktrees-venv")),
+        &checkout,
+        &TaskId::generate(SystemTime::now()),
+        "main",
+    )
+    .await?;
+    assert!(wt.path.join(".venv/bin/python").exists());
+    std::fs::write(wt.path.join("src/app/__init__.py"), "OK = False\n")?;
+
+    let plan = preflight::plan(&wt.path, &config())?;
+    assert_eq!(plan.command, [".venv/bin/python", "-m", "pytest"]);
+    let in_checkout = preflight::run(
+        &checkout,
+        &preflight::plan(&checkout, &config())?,
+        &config(),
+        &log(&dir),
+        std::future::pending(),
+    )
+    .await?;
+    assert!(in_checkout.passed(), "{in_checkout:?}");
+    let result = preflight::run(
+        &wt.path,
+        &plan,
+        &config(),
+        &log(&dir),
+        std::future::pending(),
+    )
+    .await?;
+    assert!(!result.passed(), "{result:?}");
+    let expected = wt.path.join("src/app/__init__.py");
+    assert!(
+        result
+            .output_tail
+            .contains(&format!("app from {}", expected.display())),
+        "{result:?}"
+    );
+    Ok(())
+}

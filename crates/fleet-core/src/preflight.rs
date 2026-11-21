@@ -6,6 +6,7 @@
 //! Opcionalmente (`[preflight.act]`), después de las pruebas nativas se repite un job de
 //! GitHub Actions con `act` (ver [`run_act`]).
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,6 +25,8 @@ pub const CONFIG_FILE: &str = "fleet.toml";
 /// Lo que escribe `npm init` en `scripts.test`: no es una prueba, es un recordatorio.
 const NPM_PLACEHOLDER_TEST: &str = "no test specified";
 const CHANNEL_CAPACITY: usize = 256;
+/// Ficheros que delatan un proyecto de pytest.
+const PYTHON_MARKERS: [&str; 3] = ["pyproject.toml", "pytest.ini", "setup.py"];
 
 /// Cómo se pasa el pre-flight en un repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +36,8 @@ pub struct PreflightPlan {
     pub timeout: Duration,
     /// De dónde salió: `fleet.toml` o el fichero que delató el stack.
     pub source: String,
+    /// Variables de entorno que se añaden al comando, con rutas ya absolutas al worktree.
+    pub env: Vec<(String, OsString)>,
     /// Job de GitHub Actions que se repite con `act` si las pruebas nativas pasan.
     pub act: Option<ActPlan>,
 }
@@ -85,6 +90,8 @@ pub enum PreflightError {
     Process(#[from] ProcessError),
     #[error("the pre-flight was cancelled")]
     Cancelled,
+    #[error("cannot put {0} on PYTHONPATH: the path contains a path separator")]
+    PythonPath(PathBuf),
     #[error("cannot prepare a clean clone for act: {0}")]
     ActClone(String),
 }
@@ -134,7 +141,7 @@ pub fn plan(root: &Path, config: &PreflightConfig) -> Result<PreflightPlan, Pref
             return Err(invalid("preflight.act.job must name a job"));
         }
     }
-    let (source, command) = match section.command {
+    let (source, command, env) = match section.command {
         Some(command) => {
             if command
                 .first()
@@ -142,18 +149,24 @@ pub fn plan(root: &Path, config: &PreflightConfig) -> Result<PreflightPlan, Pref
             {
                 return Err(invalid("preflight.command must name a program"));
             }
-            (CONFIG_FILE.to_owned(), command)
+            (CONFIG_FILE.to_owned(), command, Vec::new())
         }
         None => {
             let (marker, command) =
                 detect(root)?.ok_or_else(|| PreflightError::NoCommand(root.to_path_buf()))?;
-            (marker.to_owned(), command)
+            let env = if PYTHON_MARKERS.contains(&marker) {
+                python_code_env(root)?
+            } else {
+                Vec::new()
+            };
+            (marker.to_owned(), command, env)
         }
     };
     Ok(PreflightPlan {
         command,
         timeout,
         source,
+        env,
         act: section.act,
     })
 }
@@ -184,7 +197,7 @@ fn detect(root: &Path) -> Result<Option<(&'static str, Vec<String>)>, PreflightE
             return Ok(Some(("package.json", owned(&["npm", "test"]))));
         }
     }
-    for marker in ["pyproject.toml", "pytest.ini", "setup.py"] {
+    for marker in PYTHON_MARKERS {
         if root.join(marker).is_file() {
             // El `.venv` del checkout va enlazado en el worktree: su Python tiene las dependencias
             let python = if root.join(".venv/bin/python").exists() {
@@ -202,6 +215,25 @@ fn detect(root: &Path) -> Result<Option<(&'static str, Vec<String>)>, PreflightE
         return Ok(Some(("Package.swift", owned(&["swift", "test"]))));
     }
     Ok(None)
+}
+
+/// `PYTHONPATH` y `MYPYPATH` con `<root>/src` (si existe) y `<root>` delante. El `.venv`
+/// enlazado es el del checkout y, con el paquete instalado en modo editable, su `.pth` apunta
+/// al código del checkout: sin esto las pruebas del worktree importarían el código de Juan y
+/// podrían dar verde en falso.
+fn python_code_env(root: &Path) -> Result<Vec<(String, OsString)>, PreflightError> {
+    let src = root.join("src");
+    let mut roots = Vec::new();
+    if src.is_dir() {
+        roots.push(src);
+    }
+    roots.push(root.to_path_buf());
+    let joined =
+        std::env::join_paths(&roots).map_err(|_| PreflightError::PythonPath(root.to_path_buf()))?;
+    Ok(vec![
+        ("PYTHONPATH".to_owned(), joined.clone()),
+        ("MYPYPATH".to_owned(), joined),
+    ])
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, PreflightError> {
@@ -245,7 +277,8 @@ where
         .args(args)
         .current_dir(root)
         // Muchas herramientas de pruebas dejan el modo interactivo o «watch» con esto
-        .env("CI", "true");
+        .env("CI", "true")
+        .envs(plan.env.iter().map(|(key, value)| (key, value)));
     worktree::isolate_git_env(&mut command);
 
     let mut file = open_log(log).await.map_err(log_error)?;
@@ -339,6 +372,7 @@ where
         command,
         timeout,
         source: format!("act job `{}`", act.job),
+        env: Vec::new(),
         act: None,
     };
     let result = run(&clone, &plan, config, log, cancel).await;
@@ -524,6 +558,34 @@ mod tests {
         for (files, command) in cases {
             assert_eq!(planned(files)?.command, command, "{files:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn python_puts_the_worktree_code_first() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = repo(&[("pyproject.toml", ""), ("src/app/__init__.py", "")])?;
+        let plan = plan(dir.path(), &PreflightConfig::default())?;
+        let expected = std::env::join_paths([dir.path().join("src"), dir.path().to_path_buf()])?;
+        assert_eq!(
+            plan.env,
+            [
+                ("PYTHONPATH".to_owned(), expected.clone()),
+                ("MYPYPATH".to_owned(), expected),
+            ]
+        );
+
+        let flat = repo(&[("setup.py", "")])?;
+        let plan = super::plan(flat.path(), &PreflightConfig::default())?;
+        let only_root = OsString::from(flat.path());
+        assert_eq!(plan.env[0], ("PYTHONPATH".to_owned(), only_root));
+
+        let other = planned(&[("Cargo.toml", "")])?;
+        assert!(other.env.is_empty());
+        let explicit = planned(&[
+            ("pyproject.toml", ""),
+            ("fleet.toml", "[preflight]\ncommand = [\"tox\"]\n"),
+        ])?;
+        assert!(explicit.env.is_empty());
         Ok(())
     }
 
