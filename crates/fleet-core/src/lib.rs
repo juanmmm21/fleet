@@ -10,14 +10,16 @@ pub mod cli;
 pub mod preflight;
 pub mod process;
 pub mod recovery;
+pub mod runner;
 pub mod store;
 pub mod task;
 pub mod worktree;
 
 pub use agent::{AgentError, AgentProvider};
 pub use preflight::PreflightResult;
-pub use process::{ProcessError, ProcessOutput};
+pub use process::{OutputLine, ProcessError, ProcessOutput, Stream, StreamEnd, StreamOptions};
 pub use recovery::{Recovered, Recovery, RecoveryError};
+pub use runner::{AgentReport, RunConfig, RunError};
 pub use store::{Store, StoreError};
 pub use task::{NewTaskError, Task, TaskId, TaskIdError, TaskSpec, TaskState, TransitionError};
 pub use worktree::{

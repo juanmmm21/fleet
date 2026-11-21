@@ -546,8 +546,14 @@ async fn check_base(config: &WorktreeConfig, repo: &Path, base: &str) -> Result<
 
 fn git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
+    command.current_dir(cwd);
+    isolate_git_env(&mut command);
     command
-        .current_dir(cwd)
+}
+
+/// Entorno de git para cualquier proceso que trabaje en un worktree (git o un agente).
+pub(crate) fn isolate_git_env(command: &mut Command) {
+    command
         // Un fetch que pide contraseña se quedaría colgado hasta el plazo sin nadie delante
         .env("GIT_TERMINAL_PROMPT", "0")
         // Si fleet corre desde un hook de git, estas variables apuntarían a otro repo
@@ -555,7 +561,6 @@ fn git_command(cwd: &Path) -> Command {
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_COMMON_DIR");
-    command
 }
 
 async fn git(
