@@ -12,17 +12,18 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use fleet_core::{AgentProvider, RepoRef, TaskId, TaskSpec};
+use fleet_core::placement::{self, NodeCapacity};
+use fleet_core::{AgentProvider, RepoRef, TaskId, TaskSpec, TaskState};
 use futures_util::stream::{self, Stream};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 
 use crate::engine::{Engine, EngineError};
 use crate::guard::{self, HostPolicy};
-use crate::nodes::Nodes;
+use crate::nodes::{Health, NodeInfo, Nodes};
 use crate::proxy::{self, ProxyState};
 use crate::web;
 
@@ -137,30 +138,96 @@ fn parse_body<T: DeserializeOwned>(body: &Bytes) -> ApiResult<T> {
     })
 }
 
-async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({ "version": fleet_core::VERSION, "node": state.node }))
+/// Tareas que ocupan la máquina ahora mismo: lo que cuenta para repartir.
+async fn live_tasks(engine: &Engine) -> ApiResult<usize> {
+    Ok(engine
+        .list()
+        .await?
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.state,
+                TaskState::Provisioning | TaskState::Agent | TaskState::Preflight
+            )
+        })
+        .count())
 }
 
-#[derive(Debug, Deserialize)]
+async fn health(State(state): State<AppState>) -> ApiResult<Json<Health>> {
+    Ok(Json(Health {
+        node: state.node.clone(),
+        version: fleet_core::VERSION.to_owned(),
+        os: std::env::consts::OS.to_owned(),
+        gpu: state.nodes.local_gpu(),
+        live_tasks: live_tasks(&state.engine).await?,
+    }))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CreateTask {
     repo: RepoRef,
     prompt: String,
     agent: AgentProvider,
+    #[serde(skip_serializing_if = "Option::is_none")]
     base: Option<String>,
+    /// Nombre de un nodo o `auto` para que decida el reparto.
+    #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<String>,
 }
 
-async fn list_nodes(State(state): State<AppState>) -> Json<Vec<crate::nodes::NodeInfo>> {
-    Json(state.nodes.list().await)
+async fn list_nodes(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeInfo>>> {
+    Ok(Json(nodes_with_load(&state).await?))
+}
+
+/// Los nodos, con las tareas vivas de este contadas ahora.
+async fn nodes_with_load(state: &AppState) -> ApiResult<Vec<NodeInfo>> {
+    let mut nodes = state.nodes.list().await;
+    let local = live_tasks(&state.engine).await?;
+    for node in nodes.iter_mut().filter(|node| node.local) {
+        node.live_tasks = local;
+    }
+    Ok(nodes)
+}
+
+/// `"node": "auto"`: el nodo donde debe ir la tarea según el ADR 0002.
+async fn place(state: &AppState, repo: &RepoRef, agent: &AgentProvider) -> ApiResult<String> {
+    let path = repo.resolve(&state.repos_root);
+    // El checkout se mira aquí si existe; en otra máquina estará en el mismo sitio relativo
+    let need = placement::need(path.is_dir().then_some(path.as_path()), agent);
+    let online: Vec<NodeCapacity> = nodes_with_load(state)
+        .await?
+        .into_iter()
+        .filter(|node| node.online)
+        .map(|node| NodeCapacity {
+            name: node.name,
+            os: node.os,
+            gpu: node.gpu,
+            live_tasks: node.live_tasks,
+            local: node.local,
+        })
+        .collect();
+    placement::choose(need, &online)
+        .map_err(|err| ApiError::new(StatusCode::CONFLICT, "no_capable_node", err.to_string()))
 }
 
 async fn create_task(State(state): State<AppState>, body: Bytes) -> ApiResult<Response> {
-    let request: CreateTask = parse_body(&body)?;
+    let mut request: CreateTask = parse_body(&body)?;
+    if request.node.as_deref() == Some("auto") {
+        let chosen = place(&state, &request.repo, &request.agent).await?;
+        request.node = Some(chosen);
+    }
     if let Some(node) = &request.node
         && node != &state.node
     {
-        // Se crea allí, con el mismo cuerpo: el otro nodo resuelve el repo en su máquina
+        // Se crea allí: el otro nodo resuelve el repo en su máquina
+        let body = Bytes::from(serde_json::to_vec(&request).map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("cannot encode the task: {err}"),
+            )
+        })?);
         return Ok(forward_create(&state, node, body).await);
     }
     let repo = request.repo.resolve(&state.repos_root);

@@ -26,6 +26,15 @@ pub struct NodeInfo {
     /// Base de su API (sin `/v1`); vacía para este nodo, al que se llega sin red.
     pub url: String,
     pub version: String,
+    /// `linux` o `macos`.
+    #[serde(default)]
+    pub os: String,
+    /// Tiene GPU para Ollama (`fleetd --gpu`).
+    #[serde(default)]
+    pub gpu: bool,
+    /// Tareas en marcha cuando se le preguntó por última vez.
+    #[serde(default)]
+    pub live_tasks: usize,
     pub online: bool,
     /// Este mismo `fleetd`.
     pub local: bool,
@@ -33,10 +42,18 @@ pub struct NodeInfo {
     pub last_seen_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Health {
-    node: String,
-    version: String,
+/// Lo que responde `/v1/health`; los campos nuevos con valor por defecto para hablar con un
+/// `fleetd` más viejo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Health {
+    pub node: String,
+    pub version: String,
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub gpu: bool,
+    #[serde(default)]
+    pub live_tasks: usize,
 }
 
 /// Cómo se buscan los nodos.
@@ -48,6 +65,8 @@ pub struct NodesConfig {
     pub tailscale: Option<Tailscale>,
     /// URLs de `--peer`, que se sondean siempre.
     pub peers: Vec<String>,
+    /// Esta máquina tiene GPU para Ollama.
+    pub gpu: bool,
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +130,7 @@ impl Nodes {
             local: name.into(),
             tailscale: None,
             peers: Vec::new(),
+            gpu: false,
         })
     }
 
@@ -125,11 +145,21 @@ impl Nodes {
         &self.client
     }
 
+    /// Si esta máquina tiene GPU para Ollama.
+    #[must_use]
+    pub fn local_gpu(&self) -> bool {
+        self.config.gpu
+    }
+
+    /// Este nodo; `live_tasks` lo pone quien tiene el motor.
     fn local_info(&self) -> NodeInfo {
         NodeInfo {
             name: self.config.local.clone(),
             url: String::new(),
             version: fleet_core::VERSION.to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            gpu: self.config.gpu,
+            live_tasks: 0,
             online: true,
             local: true,
             last_seen_ms: Some(now_ms()),
@@ -197,6 +227,9 @@ impl Nodes {
                     name: health.node,
                     url,
                     version: health.version,
+                    os: health.os,
+                    gpu: health.gpu,
+                    live_tasks: health.live_tasks,
                     online: true,
                     local: false,
                     last_seen_ms: Some(seen_at),

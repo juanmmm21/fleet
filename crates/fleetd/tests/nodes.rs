@@ -33,6 +33,8 @@ async fn start(
         local: name.to_owned(),
         tailscale: None,
         peers,
+        // En los tests el «Mac» es el de la GPU: así el reparto tiene que salir de casa
+        gpu: name == "mac",
     })?;
     let router = api::router(AppState {
         engine: engine.clone(),
@@ -209,6 +211,54 @@ async fn one_node_drives_another_through_its_api() -> TestResult {
     );
 
     pc.stop.send_replace(true);
+    pc.server.await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_places_tasks_by_need_and_load() -> TestResult {
+    let mac_fx = fixture()?;
+    let mac = start(&mac_fx, "mac", Vec::new()).await?;
+    let pc_fx = fixture()?;
+    let pc = start(&pc_fx, "pc", vec![mac.url.clone()]).await?;
+    let create = |agent: Value| {
+        let url = format!("{}/v1/tasks", pc.url);
+        async move {
+            send(
+                reqwest::Method::POST,
+                &url,
+                Some(json!({ "repo": "app", "prompt": "auto", "agent": agent, "node": "auto" })),
+            )
+            .await
+        }
+    };
+
+    // Ollama, al nodo con GPU
+    let (status, task) = create(json!({ "kind": "ollama", "model": "qwen3-coder:30b" })).await?;
+    assert_eq!(status, 201, "{task}");
+    assert_eq!(task["repo"], json!(mac_fx.checkout));
+    let id = TaskId::parse(task["id"].as_str().ok_or("no id")?)?;
+    assert!(mac.engine.get(&id).await.is_ok());
+
+    // Lo demás, al menos ocupado: el Mac aún tiene la de Ollama en marcha o acaba de
+    // terminarla; a igualdad se queda en casa, así que nunca va al Mac
+    let (status, task) = create(json!({ "kind": "claude" })).await?;
+    assert_eq!(status, 201, "{task}");
+    assert_eq!(task["repo"], json!(pc_fx.checkout));
+
+    // Un proyecto de Xcode sin ningún macOS en línea (aquí todo es Linux) no se lanza
+    std::fs::create_dir_all(pc_fx.checkout.join("App.xcodeproj"))?;
+    let (status, body) = create(json!({ "kind": "claude" })).await?;
+    if std::env::consts::OS == "macos" {
+        assert_eq!(status, 201, "{body}");
+    } else {
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], json!("no_capable_node"));
+    }
+
+    mac.stop.send_replace(true);
+    pc.stop.send_replace(true);
+    mac.server.await?;
     pc.server.await?;
     Ok(())
 }

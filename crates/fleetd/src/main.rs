@@ -67,6 +67,7 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
         local: node.clone(),
         tailscale: Some(Tailscale::default()),
         peers: serve_args.peers.clone(),
+        gpu: serve_args.gpu,
     })
     .context("cannot set up the node registry")?;
     let listener = tokio::net::TcpListener::bind(serve_args.listen)

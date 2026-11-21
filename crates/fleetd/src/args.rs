@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "usage: fleetd [--listen 127.0.0.1:7171] [--state-dir DIR] \
                          [--repos-root DIR] [--allow-host NAME]... [--allow-login LOGIN]... \
-                         [--peer URL]... | --version | --help";
+                         [--peer URL]... [--gpu] | --version | --help";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7171";
 
 /// Qué pide la línea de órdenes.
@@ -28,6 +28,8 @@ pub struct ServeArgs {
     pub allow_logins: Vec<String>,
     /// Otros `fleetd` a sondear siempre, además de los que se encuentren en la tailnet.
     pub peers: Vec<String>,
+    /// Esta máquina tiene GPU para Ollama: le tocan las tareas de Ollama en el reparto.
+    pub gpu: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -66,6 +68,7 @@ where
     let mut repos_root = None;
     let mut allow_logins = Vec::new();
     let mut peers = Vec::new();
+    let mut gpu = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -84,6 +87,7 @@ where
                 }
                 repos_root = Some(PathBuf::from(raw));
             }
+            "--gpu" => gpu = true,
             "--peer" => {
                 let url = args.next().ok_or(ArgsError::MissingValue("--peer"))?;
                 peers.push(peer_url(url)?);
@@ -127,6 +131,7 @@ where
         allow_hosts,
         allow_logins,
         peers,
+        gpu,
     }))
 }
 
@@ -198,6 +203,7 @@ mod tests {
                 allow_hosts: Vec::new(),
                 allow_logins: Vec::new(),
                 peers: Vec::new(),
+                gpu: false,
             }))
         );
         let xdg = |key: &str| match key {
@@ -233,7 +239,8 @@ mod tests {
                     "--allow-login",
                     "friend@example.com",
                     "--peer",
-                    "https://mac.tail1234.ts.net/"
+                    "https://mac.tail1234.ts.net/",
+                    "--gpu"
                 ]),
                 |_| None
             ),
@@ -246,6 +253,7 @@ mod tests {
                 allow_hosts: vec!["pc".to_owned(), "mac.local".to_owned()],
                 allow_logins: vec!["friend@example.com".to_owned()],
                 peers: vec!["https://mac.tail1234.ts.net".to_owned()],
+                gpu: true,
             }))
         );
         assert_eq!(

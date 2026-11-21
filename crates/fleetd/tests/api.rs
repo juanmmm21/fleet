@@ -71,7 +71,13 @@ async fn health_says_version_and_node() -> TestResult {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
-        json!({ "version": fleet_core::VERSION, "node": "pc" })
+        json!({
+            "version": fleet_core::VERSION,
+            "node": "pc",
+            "os": std::env::consts::OS,
+            "gpu": false,
+            "live_tasks": 0
+        })
     );
     Ok(())
 }
