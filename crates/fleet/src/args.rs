@@ -12,6 +12,7 @@ pub const USAGE: &str = "usage:
   fleet diff <id>
   fleet answer <id> <text...>
   fleet merge|drop|cancel <id>
+  fleet tui
   fleet --version | --help
 
 FLEET_URL points at fleetd (default http://127.0.0.1:7171).";
@@ -30,6 +31,7 @@ pub enum Command {
     Merge { id: TaskId },
     Drop { id: TaskId },
     Cancel { id: TaskId },
+    Tui,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +117,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, ArgsErr
         "cancel" => Ok(Command::Cancel {
             id: single_id(&rest)?,
         }),
+        "tui" => {
+            no_positional(&rest)?;
+            Ok(Command::Tui)
+        }
         other => Err(ArgsError::UnknownCommand(other.to_owned())),
     }
 }

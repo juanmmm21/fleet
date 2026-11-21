@@ -4,6 +4,7 @@
 pub mod args;
 pub mod client;
 pub mod output;
+pub mod tui;
 
 use std::io::{self, Write};
 
@@ -77,6 +78,7 @@ pub fn execute(command: Command, client: &Client, out: &mut impl Write) -> Resul
             client.cancel(&id)?;
             writeln!(out, "cancelling {id}")?;
         }
+        Command::Tui => tui::run(client)?,
     }
     Ok(())
 }
