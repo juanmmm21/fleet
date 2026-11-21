@@ -253,6 +253,52 @@ async fn events_stream_over_sse() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn serves_the_web_with_relative_paths_and_a_strict_csp() -> TestResult {
+    let fx = fixture()?;
+    let (router, _) = app(&fx).await?;
+    for (uri, content_type) in [
+        ("/", "text/html"),
+        ("/app.js", "text/javascript"),
+        ("/app.css", "text/css"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let headers = response.headers();
+        let header = |name: header::HeaderName| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(
+            header(header::CONTENT_TYPE).starts_with(content_type),
+            "{uri}"
+        );
+        assert!(header(header::CONTENT_SECURITY_POLICY).contains("script-src 'self'"));
+        let body = response.into_body().collect().await?.to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        // Nada absoluto: detrás de `tailscale serve` con prefijo tiene que seguir funcionando
+        assert!(!text.contains("\"/v1"), "{uri} uses an absolute API path");
+        assert!(
+            !text.contains("src=\"/") && !text.contains("href=\"/"),
+            "{uri}"
+        );
+    }
+    let (status, body) = call(&router, "GET", "/app.js", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("new EventSource(API + \"events\")"));
+    assert!(
+        !body.contains("innerHTML"),
+        "task text must never be parsed as HTML"
+    );
+    Ok(())
+}
+
 async fn with_headers(
     router: &Router,
     method: &str,

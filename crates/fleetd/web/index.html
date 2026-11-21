@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fleet</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <h1>fleet</h1>
+    <span id="node" class="muted"></span>
+    <span id="conn" class="conn" data-state="connecting">connecting</span>
+    <button id="new-toggle" type="button">New task</button>
+  </header>
+
+  <form id="new-task" class="panel new-task" hidden>
+    <label>Repository <input name="repo" required placeholder="/home/you/Desarrollo/project" autocomplete="off"></label>
+    <label class="wide">Prompt <textarea name="prompt" required rows="4"></textarea></label>
+    <label>Agent
+      <select name="agent">
+        <option value="claude">claude</option>
+        <option value="agy">agy</option>
+        <option value="ollama">ollama</option>
+      </select>
+    </label>
+    <label>Model <input name="model" placeholder="default" autocomplete="off"></label>
+    <label>Base <input name="base" placeholder="origin default" autocomplete="off"></label>
+    <div class="actions"><button type="submit" class="primary">Run</button></div>
+  </form>
+
+  <div id="overlaps" class="overlaps" hidden></div>
+  <div id="status" class="status" role="status" hidden></div>
+
+  <main class="layout">
+    <section class="panel tasks">
+      <h2>Tasks</h2>
+      <ul id="task-list"></ul>
+      <p id="empty" class="muted">No tasks yet.</p>
+    </section>
+
+    <section class="panel detail" id="detail" hidden>
+      <div class="detail-head">
+        <span id="d-state" class="badge"></span>
+        <code id="d-id"></code>
+        <span id="d-meta" class="muted"></span>
+      </div>
+      <p id="d-prompt" class="prompt"></p>
+      <p id="d-failure" class="failure" hidden></p>
+      <div id="d-question" class="question" hidden>
+        <p id="d-question-text"></p>
+        <form id="answer-form">
+          <input name="answer" required placeholder="Your answer" autocomplete="off">
+          <button type="submit" class="primary">Answer</button>
+        </form>
+      </div>
+      <p id="d-preflight" class="muted" hidden></p>
+      <div class="actions">
+        <button id="merge" type="button" class="primary" hidden>Merge</button>
+        <button id="cancel" type="button" hidden>Cancel</button>
+        <button id="drop" type="button" class="danger" hidden>Drop</button>
+      </div>
+      <nav class="tabs">
+        <button type="button" data-tab="log" class="active">Output</button>
+        <button type="button" data-tab="diff">Diff</button>
+      </nav>
+      <pre id="output" class="output"></pre>
+    </section>
+  </main>
+</body>
+</html>

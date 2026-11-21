@@ -22,6 +22,7 @@ use tokio::sync::watch;
 
 use crate::engine::{Engine, EngineError};
 use crate::guard::{self, HostPolicy};
+use crate::web;
 
 /// Lo que comparten los manejadores.
 #[derive(Clone)]
@@ -36,7 +37,7 @@ pub struct AppState {
     pub hosts: HostPolicy,
 }
 
-/// La API y por delante la defensa frente a otras webs del navegador.
+/// La API, la web y por delante la defensa frente a otras webs del navegador.
 pub fn router(state: AppState) -> Router {
     let hosts = state.hosts.clone();
     Router::new()
@@ -51,6 +52,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tasks/{id}/drop", post(drop_task))
         .route("/v1/overlaps", get(overlaps))
         .route("/v1/events", get(events))
+        .merge(web::router())
         .fallback(not_found)
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(hosts, guard::layer))
