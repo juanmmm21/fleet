@@ -9,12 +9,14 @@ pub mod agent;
 pub mod cli;
 pub mod preflight;
 pub mod process;
+pub mod store;
 pub mod task;
 pub mod worktree;
 
 pub use agent::{AgentError, AgentProvider};
 pub use preflight::PreflightResult;
 pub use process::{ProcessError, ProcessOutput};
+pub use store::{Store, StoreError};
 pub use task::{NewTaskError, Task, TaskId, TaskIdError, TaskSpec, TaskState, TransitionError};
 pub use worktree::{Removal, Worktree, WorktreeConfig, WorktreeError};
 
