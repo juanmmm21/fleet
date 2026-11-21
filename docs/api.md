@@ -95,6 +95,7 @@ Any task that is not `merged` or `dropped` can be dropped.
 - `agent.kind` is `claude`, `agy`, `ollama` (with a required local `model`) or `external`. `claude` and `agy` take an optional `model`.
 - `client` is an optional label chosen by whoever created the task; fleet does not interpret it.
 - `worktree`, `failure`, `question`, `preflight`, `session_id`, `diff` and `client` may be `null`.
+- `preflight.command` is the command that decided the result. When the pre-flight chains several checks (pytest, ruff and mypy in a Python repository), `preflight.checks` lists the ones that ran, in order: the last one is `command`, the one that failed or the final one if all passed. `checks` is absent when there is a single command.
 - `diff.files[].kind` is `added`, `modified`, `deleted` or `type_changed`.
 
 ### Endpoints
@@ -137,7 +138,7 @@ Creating a task:
 
 ### Repository settings
 
-The pre-flight runs the repository's own tests. fleet detects a `Makefile` with a `test` target, Cargo, npm, pytest and Go. Detected pytest projects run with `PYTHONPATH` and `MYPYPATH` pointing at the worktree's `src/` (if any) and its root, ahead of an editable install in the linked `.venv`. Otherwise, or to override, add a `fleet.toml` to the repository:
+The pre-flight runs the repository's own tests. fleet detects a `Makefile` with a `test` target, Cargo, npm, pytest and Go. Detected pytest projects run with `PYTHONPATH` and `MYPYPATH` pointing at the worktree's `src/` (if any) and its root, ahead of an editable install in the linked `.venv`. If the repository has a `.venv` and its `pyproject.toml` mentions them, `ruff check .` and `mypy` follow pytest with the `.venv`'s Python. mypy gets `--strict src` without a `[tool.mypy]` table, `src` with one and no arguments when that table sets `files`. Without `src/` or `files`, mypy is skipped. The checks run in order within one timeout, and the first failure stops the rest and names its check (`ruff failed: ...`). Otherwise, or to override, add a `fleet.toml` to the repository:
 
 ```toml
 [preflight]
