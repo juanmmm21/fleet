@@ -97,6 +97,7 @@ fn daemon() -> Result<Daemon, Box<dyn std::error::Error>> {
             engine,
             node: "test".to_owned(),
             shutdown,
+            hosts: fleetd::guard::HostPolicy::default(),
         });
         tokio::spawn(async move {
             // El emisor vive lo que el servidor: soltarlo no cierra los flujos de eventos

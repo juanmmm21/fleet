@@ -4,5 +4,6 @@
 pub mod api;
 pub mod args;
 pub mod engine;
+pub mod guard;
 
 pub use engine::{Engine, EngineConfig, EngineError, Event, OutputStream};

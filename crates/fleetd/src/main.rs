@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use anyhow::Context;
 use fleetd::api::{self, AppState};
 use fleetd::args::{self, Command, ServeArgs, USAGE};
+use fleetd::guard::HostPolicy;
 use fleetd::{Engine, EngineConfig};
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -63,7 +64,7 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("cannot listen on {}", serve_args.listen))?;
     eprintln!(
-        "fleetd {} on http://{} (node {node}, state {})",
+        "fleetd {} on http://{}/ (node {node}, state {})",
         fleet_core::VERSION,
         serve_args.listen,
         serve_args.state_dir.display()
@@ -86,6 +87,9 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
         engine,
         node,
         shutdown: stopping_rx,
+        hosts: HostPolicy {
+            extra: serve_args.allow_hosts.clone(),
+        },
     };
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(shutdown)

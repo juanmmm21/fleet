@@ -23,6 +23,7 @@ async fn app(fx: &Fixture) -> Result<(Router, Engine), Box<dyn std::error::Error
         engine: engine.clone(),
         node: "pc".to_owned(),
         shutdown,
+        hosts: fleetd::guard::HostPolicy::default(),
     });
     Ok((router, engine))
 }
@@ -249,5 +250,73 @@ async fn events_stream_over_sse() -> TestResult {
     let text = String::from_utf8_lossy(&chunk);
     assert!(text.starts_with("event: task\ndata: {"), "{text}");
     assert!(text.contains("\"state\":\"provisioning\""), "{text}");
+    Ok(())
+}
+
+async fn with_headers(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> Result<(StatusCode, Value), Box<dyn std::error::Error>> {
+    let mut request = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = router
+        .clone()
+        .oneshot(request.body(Body::from(
+            json!({ "repo": "/nowhere", "prompt": "x", "agent": { "kind": "claude" } }).to_string(),
+        ))?)
+        .await?;
+    let status = response.status();
+    let bytes = response.into_body().collect().await?.to_bytes();
+    Ok((
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_websites_cannot_drive_the_daemon() -> TestResult {
+    let fx = fixture()?;
+    let (router, engine) = app(&fx).await?;
+    // CSRF: una web cualquiera manda un POST simple a 127.0.0.1
+    let (status, body) = with_headers(
+        &router,
+        "POST",
+        "/v1/tasks",
+        &[
+            ("host", "127.0.0.1:7171"),
+            ("origin", "https://evil.example"),
+            ("content-type", "text/plain"),
+        ],
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error_code(&body), Some("forbidden"));
+    // DNS rebinding: un dominio ajeno que resuelve a 127.0.0.1, incluso para leer
+    let (status, _) = with_headers(
+        &router,
+        "GET",
+        "/v1/tasks",
+        &[("host", "rebind.evil.example:7171")],
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(engine.list().await?.is_empty());
+
+    // La propia web sí: mismo origen (aquí falla después, porque el repo no existe)
+    let (status, body) = with_headers(
+        &router,
+        "POST",
+        "/v1/tasks",
+        &[
+            ("host", "127.0.0.1:7171"),
+            ("origin", "http://127.0.0.1:7171"),
+        ],
+    )
+    .await?;
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
     Ok(())
 }

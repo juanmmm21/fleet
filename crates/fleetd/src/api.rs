@@ -21,6 +21,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 
 use crate::engine::{Engine, EngineError};
+use crate::guard::{self, HostPolicy};
 
 /// Lo que comparten los manejadores.
 #[derive(Clone)]
@@ -31,9 +32,13 @@ pub struct AppState {
     /// Pasa a `true` al apagar: los flujos SSE se cierran para que el apagado no espere por
     /// ellos (nunca acaban solos).
     pub shutdown: watch::Receiver<bool>,
+    /// Qué `Host` se aceptan (ver [`crate::guard`]).
+    pub hosts: HostPolicy,
 }
 
+/// La API y por delante la defensa frente a otras webs del navegador.
 pub fn router(state: AppState) -> Router {
+    let hosts = state.hosts.clone();
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/tasks", get(list_tasks).post(create_task))
@@ -48,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/events", get(events))
         .fallback(not_found)
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(hosts, guard::layer))
 }
 
 /// Error de la API: código HTTP y `{"error": {"code", "message"}}`.

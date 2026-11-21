@@ -3,8 +3,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-pub const USAGE: &str =
-    "usage: fleetd [--listen 127.0.0.1:7171] [--state-dir DIR] | --version | --help";
+pub const USAGE: &str = "usage: fleetd [--listen 127.0.0.1:7171] [--state-dir DIR] \
+                         [--allow-host NAME]... | --version | --help";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7171";
 
 /// Qué pide la línea de órdenes.
@@ -19,6 +19,8 @@ pub enum Command {
 pub struct ServeArgs {
     pub listen: SocketAddr,
     pub state_dir: PathBuf,
+    /// Nombres de máquina aceptados en `Host` además de loopback y `*.ts.net`.
+    pub allow_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -31,6 +33,8 @@ pub enum ArgsError {
     BadAddress(String),
     #[error("fleetd only listens on loopback, not on {0}; share it with `tailscale serve`")]
     NotLoopback(SocketAddr),
+    #[error("`{0}` is not a host name (no scheme, port or path)")]
+    BadHost(String),
     #[error("cannot find a state folder: set XDG_STATE_HOME or HOME, or pass --state-dir")]
     NoStateDir,
 }
@@ -43,6 +47,7 @@ where
 {
     let mut listen = None;
     let mut state_dir = None;
+    let mut allow_hosts = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -53,6 +58,10 @@ where
                 state_dir = Some(PathBuf::from(
                     args.next().ok_or(ArgsError::MissingValue("--state-dir"))?,
                 ));
+            }
+            "--allow-host" => {
+                let host = args.next().ok_or(ArgsError::MissingValue("--allow-host"))?;
+                allow_hosts.push(host_name(host)?);
             }
             _ => return Err(ArgsError::Unknown(arg)),
         }
@@ -66,7 +75,24 @@ where
         Some(dir) => dir,
         None => default_state_dir(&env)?,
     };
-    Ok(Command::Serve(ServeArgs { listen, state_dir }))
+    Ok(Command::Serve(ServeArgs {
+        listen,
+        state_dir,
+        allow_hosts,
+    }))
+}
+
+/// Un nombre de máquina tal cual, en minúsculas: así se compara con `Host` sin el puerto.
+fn host_name(raw: String) -> Result<String, ArgsError> {
+    let valid = !raw.is_empty()
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+    if valid {
+        Ok(raw.to_ascii_lowercase())
+    } else {
+        Err(ArgsError::BadHost(raw))
+    }
 }
 
 /// `$XDG_STATE_HOME/fleet` o `~/.local/state/fleet` (ADR 0001), en Linux y en macOS.
@@ -101,6 +127,7 @@ mod tests {
             Ok(Command::Serve(ServeArgs {
                 listen: SocketAddr::from(([127, 0, 0, 1], 7171)),
                 state_dir: PathBuf::from("/home/juan/.local/state/fleet"),
+                allow_hosts: Vec::new(),
             }))
         );
         let xdg = |key: &str| (key == "XDG_STATE_HOME").then(|| "/state".to_owned());
@@ -115,7 +142,16 @@ mod tests {
     fn takes_listen_and_state_dir() {
         assert_eq!(
             parse(
-                args(&["--listen", "[::1]:9000", "--state-dir", "/tmp/fleet"]),
+                args(&[
+                    "--listen",
+                    "[::1]:9000",
+                    "--state-dir",
+                    "/tmp/fleet",
+                    "--allow-host",
+                    "PC",
+                    "--allow-host",
+                    "mac.local"
+                ]),
                 |_| None
             ),
             Ok(Command::Serve(ServeArgs {
@@ -123,8 +159,15 @@ mod tests {
                     .parse()
                     .unwrap_or_else(|_| SocketAddr::from(([0; 4], 0))),
                 state_dir: PathBuf::from("/tmp/fleet"),
+                allow_hosts: vec!["pc".to_owned(), "mac.local".to_owned()],
             }))
         );
+        for bad in ["http://pc", "pc:7171", ""] {
+            assert_eq!(
+                parse(args(&["--allow-host", bad]), home),
+                Err(ArgsError::BadHost(bad.to_owned()))
+            );
+        }
     }
 
     #[test]
