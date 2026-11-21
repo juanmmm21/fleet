@@ -186,6 +186,38 @@ async fn a_cancelled_agent_still_reports_what_it_left() -> TestResult {
 }
 
 #[tokio::test]
+async fn the_log_shows_a_running_agent_before_it_ends() -> TestResult {
+    let fx = fixture().await?;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (tx, mut rx) = mpsc::channel(16);
+    let config = fx.config.clone();
+    let worktree = fx.worktree.clone();
+    let log = fx.log();
+    let run = tokio::spawn(async move {
+        runner::run_agent(
+            &config,
+            &worktree,
+            agent("echo profiling; sleep 30 & wait"),
+            &quick(),
+            &log,
+            async move {
+                let _ = cancel_rx.await;
+            },
+            Some(tx),
+        )
+        .await
+    });
+    let first = rx.recv().await.ok_or("no output")?;
+    assert_eq!(first.line, "profiling");
+    // La línea en directo sale después de escribirla: el fichero ya la tiene
+    let text = read(&fx.log())?;
+    assert!(text.contains("started ==\nprofiling\n"), "{text}");
+    cancel_tx.send(()).map_err(|()| "agent already finished")?;
+    assert_eq!(run.await??.end, StreamEnd::Cancelled);
+    Ok(())
+}
+
+#[tokio::test]
 async fn each_run_appends_to_the_same_log() -> TestResult {
     let fx = fixture().await?;
     let config = RunConfig {

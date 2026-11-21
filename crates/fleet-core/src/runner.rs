@@ -101,6 +101,7 @@ where
     file.write_all(format!("== {} {program} started ==\n", now_ms()).as_bytes())
         .await
         .map_err(log_error)?;
+    file.flush().await.map_err(log_error)?;
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let options = StreamOptions {
@@ -265,6 +266,11 @@ impl Recorder {
                 }
                 // Si el proceso ya terminó nadie escucha el corte, y da igual
                 abort.send(()).ok();
+            }
+            // Se vuelca cuando no queda nada en cola: `GET /log` lee el fichero mientras el
+            // agente trabaja y un agente lento no llena el búfer en mucho rato
+            if write_result.is_ok() && rx.is_empty() {
+                write_result = self.file.flush().await;
             }
             if let Some(sender) = &self.live
                 && sender.send(line).await.is_err()

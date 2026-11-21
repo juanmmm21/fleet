@@ -253,6 +253,7 @@ where
     file.write_all(format!("== preflight `{label}` ({}) ==\n", plan.source).as_bytes())
         .await
         .map_err(log_error)?;
+    file.flush().await.map_err(log_error)?;
     let (tx, mut rx) = mpsc::channel::<OutputLine>(CHANNEL_CAPACITY);
     let options = StreamOptions {
         timeout: plan.timeout,
@@ -268,6 +269,10 @@ where
             };
             if result.is_ok() {
                 result = file.write_all(text.as_bytes()).await;
+            }
+            // Se vuelca cuando no queda nada en cola: `GET /log` lee el fichero en directo
+            if result.is_ok() && rx.is_empty() {
+                result = file.flush().await;
             }
             tail.push(text);
         }
