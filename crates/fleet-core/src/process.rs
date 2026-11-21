@@ -95,10 +95,10 @@ pub async fn run(mut command: Command, timeout: Duration) -> Result<ProcessOutpu
                 })?;
             }
             // Recoge al hijo para no dejar un zombi; si ya había muerto con su grupo, mejor.
-            if let Err(source) = child.kill().await {
-                if source.kind() != io::ErrorKind::InvalidInput {
-                    return Err(ProcessError::Io { program, source });
-                }
+            if let Err(source) = child.kill().await
+                && source.kind() != io::ErrorKind::InvalidInput
+            {
+                return Err(ProcessError::Io { program, source });
             }
             Err(ProcessError::TimedOut {
                 program,
