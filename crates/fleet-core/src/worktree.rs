@@ -544,7 +544,7 @@ async fn check_base(config: &WorktreeConfig, repo: &Path, base: &str) -> Result<
     }
 }
 
-fn git_command(cwd: &Path) -> Command {
+pub(crate) fn git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(cwd);
     isolate_git_env(&mut command);
@@ -563,7 +563,7 @@ pub(crate) fn isolate_git_env(command: &mut Command) {
         .env_remove("GIT_COMMON_DIR");
 }
 
-async fn git(
+pub(crate) async fn git(
     config: &WorktreeConfig,
     cwd: &Path,
     args: &[&str],
@@ -587,7 +587,7 @@ async fn git_checked(
     }
 }
 
-fn git_failure(cwd: &Path, label: &str, output: &ProcessOutput) -> WorktreeError {
+pub(crate) fn git_failure(cwd: &Path, label: &str, output: &ProcessOutput) -> WorktreeError {
     let stderr = output.stderr.trim();
     WorktreeError::Git {
         cwd: cwd.to_path_buf(),
