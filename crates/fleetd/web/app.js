@@ -11,6 +11,11 @@ const LIVE_STATES = new Set(["provisioning", "agent", "preflight"]);
 const FINAL_STATES = new Set(["merged", "dropped"]);
 
 const state = {
+  // Nodo que se está viendo; `null` es este mismo (ADR 0002: los demás van por /v1/nodes/…)
+  node: null,
+  localNode: null,
+  nodes: [],
+  source: null,
   tasks: new Map(),
   overlaps: [],
   selected: null,
@@ -28,13 +33,18 @@ class ApiError extends Error {
   }
 }
 
-async function request(method, path, body) {
+function apiBase() {
+  return state.node ? `${API}nodes/${encodeURIComponent(state.node)}/` : API;
+}
+
+// `root`: la petición va a este demonio aunque se esté viendo otro nodo (crear, nodos)
+async function request(method, path, body, root = false) {
   const init = { method, headers: {} };
   if (body !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(body);
   }
-  const response = await fetch(API + path, init);
+  const response = await fetch((root ? API : apiBase()) + path, init);
   const text = await response.text();
   if (!response.ok) {
     let code = "http_" + response.status;
@@ -244,8 +254,14 @@ function upsertTask(task) {
   renderList();
   if (task.id === state.selected) {
     renderDetail();
-    // Al terminar una vuelta del agente el diff ha cambiado
-    if (state.view === "diff" && previous && previous.state !== task.state) loadView();
+    // Con cada cambio de estado el diff cambia, y el registro gana lo que no llega en directo
+    // (cabeceras, pre-flight): se vuelve a pedir
+    if (previous && previous.state !== task.state) {
+      state.output.delete(task.id);
+      loadView();
+    }
+  } else if (previous && previous.state !== task.state) {
+    state.output.delete(task.id);
   }
 }
 
@@ -267,6 +283,51 @@ async function refresh() {
   loadView();
 }
 
+function renderNodes() {
+  const viewing = $("node-select");
+  const target = $("new-task").node;
+  const keepTarget = target.value;
+  viewing.replaceChildren();
+  target.replaceChildren(new Option("this node", ""), new Option("auto", "auto"));
+  for (const node of state.nodes) {
+    const label = node.online ? node.name : `${node.name} (offline)`;
+    const option = new Option(label, node.local ? "" : node.name);
+    option.disabled = !node.online;
+    viewing.append(option);
+    if (!node.local && node.online) target.append(new Option(node.name, node.name));
+  }
+  viewing.value = state.node || "";
+  target.value = [...target.options].some((o) => o.value === keepTarget) ? keepTarget : "";
+  viewing.hidden = state.nodes.length < 2;
+}
+
+async function loadNodes() {
+  try {
+    state.nodes = await request("GET", "nodes", undefined, true);
+  } catch (err) {
+    // Sin la lista se sigue viendo este nodo, que es lo que importa
+    console.warn("cannot list the nodes", err);
+    state.nodes = [];
+  }
+  renderNodes();
+}
+
+function viewNode(node) {
+  state.node = node || null;
+  state.tasks = new Map();
+  state.output.clear();
+  state.overlaps = [];
+  state.selected = null;
+  history.replaceState(null, "", location.pathname + location.search);
+  showStatus("");
+  renderNodes();
+  renderList();
+  renderOverlaps();
+  renderDetail();
+  setConnection("connecting");
+  connect();
+}
+
 function setConnection(name) {
   const conn = $("conn");
   conn.dataset.state = name;
@@ -274,7 +335,9 @@ function setConnection(name) {
 }
 
 function connect() {
-  const source = new EventSource(API + "events");
+  if (state.source) state.source.close();
+  const source = new EventSource(apiBase() + "events");
+  state.source = source;
   source.addEventListener("open", () => {
     setConnection("live");
     // Con el flujo ya abierto, para no perder lo que pase entre la lista y los eventos
@@ -341,10 +404,13 @@ function wire() {
       const body = { repo: form.repo.value.trim(), prompt: form.prompt.value, agent: agentFromForm(form) };
       const base = form.base.value.trim();
       if (base) body.base = base;
-      const task = await request("POST", "tasks", body);
+      if (form.node.value) body.node = form.node.value;
+      const task = await request("POST", "tasks", body, true);
       showStatus("");
       form.prompt.value = "";
       form.hidden = true;
+      const where = task.node && task.node !== state.localNode ? task.node : null;
+      if (where !== state.node) viewNode(where);
       upsertTask(task);
       select(task.id);
     } catch (err) {
@@ -378,6 +444,10 @@ function wire() {
     });
   }
 
+  $("node-select").addEventListener("change", (event) => viewNode(event.currentTarget.value));
+  // Los nodos van y vienen (el Mac se duerme): la lista se rehace de vez en cuando
+  setInterval(loadNodes, 30000);
+
   // Un enlace a `#<id>` con la página ya abierta (replaceState de `select` no lo dispara)
   window.addEventListener("hashchange", () => {
     const wanted = location.hash.slice(1);
@@ -391,11 +461,13 @@ function wire() {
 async function start() {
   wire();
   try {
-    const health = await request("GET", "health");
+    const health = await request("GET", "health", undefined, true);
+    state.localNode = health.node;
     $("node").textContent = `${health.node} · v${health.version}`;
   } catch (err) {
     reportError(err);
   }
+  await loadNodes();
   connect();
 }
 

@@ -59,6 +59,7 @@ code, pre, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 }
 
 .top h1 { font-size: 17px; margin: 0; letter-spacing: 0.02em; }
+.top select { width: auto; padding: 3px 6px; font-size: 13px; }
 .top button { margin-left: auto; }
 
 .conn { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
@@ -101,7 +102,7 @@ input, textarea, select {
 .new-task {
   margin: 16px 20px 0;
   display: grid;
-  grid-template-columns: 2fr 1fr 1fr 1fr;
+  grid-template-columns: 2fr 1fr 1fr 1fr 1fr;
   gap: 10px 12px;
 }
 .new-task label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }

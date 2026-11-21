@@ -12,6 +12,7 @@
   <header class="top">
     <h1>fleet</h1>
     <span id="node" class="muted"></span>
+    <select id="node-select" aria-label="Node" hidden></select>
     <span id="conn" class="conn" data-state="connecting">connecting</span>
     <button id="new-toggle" type="button">New task</button>
   </header>
@@ -28,6 +29,7 @@
     </label>
     <label>Model <input name="model" placeholder="default" autocomplete="off"></label>
     <label>Base <input name="base" placeholder="origin default" autocomplete="off"></label>
+    <label>Node <select name="node"><option value="">this node</option><option value="auto">auto</option></select></label>
     <div class="actions"><button type="submit" class="primary">Run</button></div>
   </form>
 
