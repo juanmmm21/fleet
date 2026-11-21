@@ -290,11 +290,9 @@ fn a_node_takes_repos_by_name_and_routes_through_the_local_daemon() -> TestResul
         }),
     )?;
     let task: serde_json::Value = serde_json::from_str(&created)?;
-    // Se mandó por nombre y el demonio lo resolvió en su raíz de repos
-    assert_eq!(
-        task["repo"],
-        serde_json::json!(daemon.checkout().canonicalize()?)
-    );
+    // Se mandó por nombre y el demonio lo resolvió en su raíz de repos (tal cual, sin
+    // resolver enlaces: en macOS la carpeta temporal cuelga de un enlace)
+    assert_eq!(task["repo"], serde_json::json!(daemon.checkout()));
     let id = TaskId::parse(task["id"].as_str().ok_or("no id")?)?;
     wait_state(&client, &id, TaskState::Ready)?;
     let listed = run(&client, Command::List { json: true })?;
