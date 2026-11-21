@@ -19,6 +19,7 @@ tokio = { version = "1.54", default-features = false }
 nix = { version = "0.32", default-features = false }
 tempfile = "3.27"
 rusqlite = { version = "0.43", features = ["bundled"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
