@@ -295,3 +295,35 @@ async fn diff_ignores_what_moved_on_in_origin() -> TestResult {
     assert_eq!(paths, ["mine.txt"]);
     Ok(())
 }
+
+#[tokio::test]
+async fn patch_shows_committed_and_pending_changes() -> TestResult {
+    let fx = fixture()?;
+    let wt = worktree::create(&fx.config, &fx.checkout, &new_id(), "main").await?;
+    assert_eq!(worktree::patch(&fx.config, &wt).await?, "");
+    commit_file(&wt.path, "src.rs", "fn main() {}\n")?;
+    std::fs::write(wt.path.join("README.md"), "app, edited\n")?;
+    let patch = worktree::patch(&fx.config, &wt).await?;
+    assert!(
+        patch.contains("+++ b/src.rs") && patch.contains("+fn main() {}"),
+        "{patch}"
+    );
+    assert!(patch.contains("+app, edited"), "{patch}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_base_comes_from_origin_head() -> TestResult {
+    let fx = fixture()?;
+    // Un clon recién hecho de un origin con `main` ya trae `origin/HEAD`
+    git(fx.dir.path(), &["clone", "--quiet", "origin.git", "fresh"])?;
+    let fresh = fx.dir.path().join("fresh");
+    assert_eq!(worktree::default_base(&fx.config, &fresh).await?, "main");
+    git(&fresh, &["remote", "set-head", "origin", "--delete"])?;
+    assert!(worktree::default_base(&fx.config, &fresh).await.is_err());
+    assert!(matches!(
+        worktree::default_base(&fx.config, Path::new("relative")).await,
+        Err(WorktreeError::InvalidRepo(_))
+    ));
+    Ok(())
+}

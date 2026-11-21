@@ -423,6 +423,48 @@ pub async fn diff(config: &WorktreeConfig, worktree: &Worktree) -> Result<Diff, 
     })
 }
 
+/// El parche completo de la tarea respecto a su base, como texto (lo commiteado y lo que está
+/// sin commitear de los ficheros que git sigue; los nuevos sin añadir salen en [`diff`]).
+pub async fn patch(config: &WorktreeConfig, worktree: &Worktree) -> Result<String, WorktreeError> {
+    let output = git(
+        config,
+        &worktree.path,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            &worktree.base_commit,
+            "--",
+        ],
+    )
+    .await?;
+    Ok(output.stdout)
+}
+
+/// Rama por defecto de `origin` según `refs/remotes/origin/HEAD`, que deja `git clone`.
+pub async fn default_base(config: &WorktreeConfig, repo: &Path) -> Result<String, WorktreeError> {
+    if !repo.is_absolute() || !repo.is_dir() {
+        return Err(WorktreeError::InvalidRepo(repo.to_path_buf()));
+    }
+    let output = git(
+        config,
+        repo,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .await?;
+    let reference = output.stdout.trim();
+    reference
+        .strip_prefix("origin/")
+        .filter(|base| !base.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| WorktreeError::InvalidBase(reference.to_owned()))
+}
+
 /// `git diff --name-status -z` sin renombrados: pares `estado\0ruta\0`.
 fn parse_name_status(raw: &str) -> Result<Vec<FileChange>, String> {
     let mut fields = raw.split('\0').filter(|field| !field.is_empty());
