@@ -10,7 +10,7 @@ use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use fleet_core::{AgentProvider, RepoRef, TaskId, TaskSpec};
 use futures_util::stream::{self, Stream};
@@ -22,6 +22,8 @@ use tokio::sync::watch;
 
 use crate::engine::{Engine, EngineError};
 use crate::guard::{self, HostPolicy};
+use crate::nodes::Nodes;
+use crate::proxy::{self, ProxyState};
 use crate::web;
 
 /// Lo que comparten los manejadores.
@@ -37,13 +39,16 @@ pub struct AppState {
     pub hosts: HostPolicy,
     /// Dónde están los repos que se piden por nombre (ADR 0002).
     pub repos_root: PathBuf,
+    /// Los otros `fleetd` de la tailnet.
+    pub nodes: Nodes,
 }
 
-/// La API, la web y por delante la defensa frente a otras webs del navegador.
+/// La API, la web, el reenvío a otros nodos y por delante la defensa frente a otras webs.
 pub fn router(state: AppState) -> Router {
     let hosts = state.hosts.clone();
-    Router::new()
+    let local = Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/nodes", get(list_nodes))
         .route("/v1/tasks", get(list_tasks).post(create_task))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/log", get(task_log))
@@ -56,7 +61,18 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/events", get(events))
         .merge(web::router())
         .fallback(not_found)
-        .with_state(state)
+        .with_state(state.clone());
+    let proxy_state = ProxyState {
+        nodes: state.nodes.clone(),
+        local: local.clone(),
+        shutdown: state.shutdown.clone(),
+    };
+    Router::new()
+        .route(
+            "/v1/nodes/{node}/{*rest}",
+            any(proxy::forward).with_state(proxy_state),
+        )
+        .merge(local)
         .layer(axum::middleware::from_fn_with_state(hosts, guard::layer))
 }
 
@@ -69,7 +85,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
             code,
@@ -135,20 +151,17 @@ struct CreateTask {
     node: Option<String>,
 }
 
+async fn list_nodes(State(state): State<AppState>) -> Json<Vec<crate::nodes::NodeInfo>> {
+    Json(state.nodes.list().await)
+}
+
 async fn create_task(State(state): State<AppState>, body: Bytes) -> ApiResult<Response> {
     let request: CreateTask = parse_body(&body)?;
     if let Some(node) = &request.node
         && node != &state.node
     {
-        // Repartir entre máquinas es la Fase 6; hasta entonces, mejor decirlo que ignorarlo
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "unknown_node",
-            format!(
-                "this is node `{}`; running on `{node}` is not supported yet",
-                state.node
-            ),
-        ));
+        // Se crea allí, con el mismo cuerpo: el otro nodo resuelve el repo en su máquina
+        return Ok(forward_create(&state, node, body).await);
     }
     let repo = request.repo.resolve(&state.repos_root);
     let base = match request.base {
@@ -165,6 +178,36 @@ async fn create_task(State(state): State<AppState>, body: Bytes) -> ApiResult<Re
         })
         .await?;
     Ok((StatusCode::CREATED, Json(task)).into_response())
+}
+
+async fn forward_create(state: &AppState, node: &str, body: Bytes) -> Response {
+    let proxy_state = ProxyState {
+        nodes: state.nodes.clone(),
+        // No se usa: el nodo no es este
+        local: Router::new(),
+        shutdown: state.shutdown.clone(),
+    };
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/tasks")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body));
+    match request {
+        Ok(request) => {
+            proxy::forward(
+                State(proxy_state),
+                Path((node.to_owned(), "tasks".to_owned())),
+                request,
+            )
+            .await
+        }
+        Err(err) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("cannot build the request: {err}"),
+        )
+        .into_response(),
+    }
 }
 
 async fn list_tasks(State(state): State<AppState>) -> ApiResult<Response> {
@@ -270,7 +313,7 @@ async fn events(
 }
 
 /// Acaba cuando empieza el apagado. Sin emisor no habrá apagado que esperar: no acaba nunca.
-async fn stopping(shutdown: &mut watch::Receiver<bool>) {
+pub(crate) async fn stopping(shutdown: &mut watch::Receiver<bool>) {
     if shutdown.wait_for(|stopping| *stopping).await.is_err() {
         std::future::pending::<()>().await;
     }

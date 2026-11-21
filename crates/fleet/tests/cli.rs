@@ -99,6 +99,7 @@ fn daemon() -> Result<Daemon, Box<dyn std::error::Error>> {
             node: "test".to_owned(),
             shutdown,
             hosts: fleetd::guard::HostPolicy::default(),
+            nodes: fleetd::nodes::Nodes::local_only("test")?,
             repos_root: repos_root.clone(),
         });
         tokio::spawn(async move {

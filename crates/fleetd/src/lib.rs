@@ -5,6 +5,8 @@ pub mod api;
 pub mod args;
 pub mod engine;
 pub mod guard;
+pub mod nodes;
+pub mod proxy;
 pub mod tailnet;
 pub mod web;
 

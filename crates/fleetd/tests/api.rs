@@ -24,6 +24,7 @@ async fn app(fx: &Fixture) -> Result<(Router, Engine), Box<dyn std::error::Error
         node: "pc".to_owned(),
         shutdown,
         hosts: fleetd::guard::HostPolicy::default(),
+        nodes: fleetd::nodes::Nodes::local_only("pc")?,
         repos_root: fx.dir.path().to_path_buf(),
     });
     Ok((router, engine))
@@ -153,7 +154,7 @@ async fn errors_have_a_status_and_a_stable_code() -> TestResult {
             Some(
                 json!({ "repo": repo, "prompt": "x", "agent": { "kind": "claude" }, "node": "mac" }),
             ),
-            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
             "unknown_node",
         ),
         (

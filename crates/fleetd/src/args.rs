@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "usage: fleetd [--listen 127.0.0.1:7171] [--state-dir DIR] \
                          [--repos-root DIR] [--allow-host NAME]... [--allow-login LOGIN]... \
-                         | --version | --help";
+                         [--peer URL]... | --version | --help";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7171";
 
 /// Qué pide la línea de órdenes.
@@ -26,6 +26,8 @@ pub struct ServeArgs {
     pub allow_hosts: Vec<String>,
     /// Logins de Tailscale que pueden entrar por la tailnet además del dueño de la máquina.
     pub allow_logins: Vec<String>,
+    /// Otros `fleetd` a sondear siempre, además de los que se encuentren en la tailnet.
+    pub peers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -44,6 +46,8 @@ pub enum ArgsError {
     NoStateDir,
     #[error("cannot find the repos folder: set HOME or pass --repos-root")]
     NoReposRoot,
+    #[error("`{0}` is not a peer URL like https://mac.tailnet.ts.net")]
+    BadPeer(String),
     #[error("`{0}` is not a Tailscale login")]
     BadLogin(String),
     #[error("`{0}` must be an absolute path")]
@@ -61,6 +65,7 @@ where
     let mut allow_hosts = Vec::new();
     let mut repos_root = None;
     let mut allow_logins = Vec::new();
+    let mut peers = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -78,6 +83,10 @@ where
                     return Err(ArgsError::NotAbsolute(raw));
                 }
                 repos_root = Some(PathBuf::from(raw));
+            }
+            "--peer" => {
+                let url = args.next().ok_or(ArgsError::MissingValue("--peer"))?;
+                peers.push(peer_url(url)?);
             }
             "--allow-login" => {
                 let login = args
@@ -117,7 +126,27 @@ where
         repos_root,
         allow_hosts,
         allow_logins,
+        peers,
     }))
+}
+
+/// `http(s)://máquina[:puerto]` sin ruta ni barra final: la API cuelga de `<url>/v1`.
+fn peer_url(raw: String) -> Result<String, ArgsError> {
+    let trimmed = raw.trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"));
+    match rest {
+        Some(authority)
+            if !authority.is_empty()
+                && authority.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
+                }) =>
+        {
+            Ok(trimmed.to_owned())
+        }
+        _ => Err(ArgsError::BadPeer(raw)),
+    }
 }
 
 /// Un nombre de máquina tal cual, en minúsculas: así se compara con `Host` sin el puerto.
@@ -168,6 +197,7 @@ mod tests {
                 repos_root: PathBuf::from("/home/juan/Desarrollo"),
                 allow_hosts: Vec::new(),
                 allow_logins: Vec::new(),
+                peers: Vec::new(),
             }))
         );
         let xdg = |key: &str| match key {
@@ -201,7 +231,9 @@ mod tests {
                     "--allow-host",
                     "mac.local",
                     "--allow-login",
-                    "friend@example.com"
+                    "friend@example.com",
+                    "--peer",
+                    "https://mac.tail1234.ts.net/"
                 ]),
                 |_| None
             ),
@@ -213,12 +245,20 @@ mod tests {
                 repos_root: PathBuf::from("/srv/repos"),
                 allow_hosts: vec!["pc".to_owned(), "mac.local".to_owned()],
                 allow_logins: vec!["friend@example.com".to_owned()],
+                peers: vec!["https://mac.tail1234.ts.net".to_owned()],
             }))
         );
         assert_eq!(
             parse(args(&["--repos-root", "repos"]), home),
             Err(ArgsError::NotAbsolute("repos".to_owned()))
         );
+        for bad in ["mac.ts.net", "ftp://mac", "https://mac/v1", "https://"] {
+            assert_eq!(
+                parse(args(&["--peer", bad]), home),
+                Err(ArgsError::BadPeer(bad.to_owned())),
+                "{bad}"
+            );
+        }
         assert_eq!(
             parse(args(&["--allow-login", "a b"]), home),
             Err(ArgsError::BadLogin("a b".to_owned()))

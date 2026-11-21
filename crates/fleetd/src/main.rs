@@ -7,6 +7,7 @@ use anyhow::Context;
 use fleetd::api::{self, AppState};
 use fleetd::args::{self, Command, ServeArgs, USAGE};
 use fleetd::guard::HostPolicy;
+use fleetd::nodes::{Nodes, NodesConfig};
 use fleetd::tailnet::Tailscale;
 use fleetd::{Engine, EngineConfig};
 use tokio::signal::unix::{SignalKind, signal};
@@ -62,6 +63,12 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
         .to_string_lossy()
         .into_owned();
     let logins = tailnet_logins(&serve_args).await;
+    let nodes = Nodes::new(NodesConfig {
+        local: node.clone(),
+        tailscale: Some(Tailscale::default()),
+        peers: serve_args.peers.clone(),
+    })
+    .context("cannot set up the node registry")?;
     let listener = tokio::net::TcpListener::bind(serve_args.listen)
         .await
         .with_context(|| format!("cannot listen on {}", serve_args.listen))?;
@@ -94,7 +101,9 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
             logins,
         },
         repos_root: serve_args.repos_root.clone(),
+        nodes: nodes.clone(),
     };
+    nodes.spawn_refresher(state.shutdown.clone());
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(shutdown)
         .await
