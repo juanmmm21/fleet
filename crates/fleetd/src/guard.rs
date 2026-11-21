@@ -5,6 +5,10 @@
 //! - Peticiones que cambian algo con un `Origin` distinto del propio: corta el CSRF.
 //!
 //! Sin `Host` ni `Origin` no hay navegador por medio (la CLI, los tests): se deja pasar.
+//!
+//! Lo que llega por la tailnet (a través de `tailscale serve`) además tiene que traer la
+//! identidad que pone Tailscale y ser del dueño de la máquina (ADR 0002): otro usuario de la
+//! tailnet o un dispositivo etiquetado no lanza agentes aquí.
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
@@ -12,31 +16,55 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-/// Qué nombres de máquina se aceptan en `Host`.
+/// Cabecera que pone `tailscale serve` con el login de quien llama (y que quita si la trae el
+/// cliente, así que no se puede falsificar desde la tailnet).
+pub const TAILSCALE_LOGIN: &str = "tailscale-user-login";
+
+/// Qué nombres de máquina se aceptan en `Host` y quién puede entrar por la tailnet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostPolicy {
     /// Además de loopback y `*.ts.net` (MagicDNS de Tailscale): nombres sin puerto, en
     /// minúsculas, p. ej. el nombre corto de la máquina en la tailnet.
     pub extra: Vec<String>,
+    /// Logins de Tailscale que pueden usar este `fleetd` por la tailnet: el dueño de la
+    /// máquina y los de `--allow-login`. Vacío: por la tailnet no entra nadie.
+    pub logins: Vec<String>,
+}
+
+/// Por dónde dice venir una petición según su `Host`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKind {
+    Loopback,
+    Tailnet,
 }
 
 impl HostPolicy {
-    /// `host` es el valor de la cabecera, con o sin puerto.
+    /// `host` es el valor de la cabecera, con o sin puerto; `None` si no se acepta.
     #[must_use]
-    pub fn allows(&self, host: &str) -> bool {
+    pub fn classify(&self, host: &str) -> Option<HostKind> {
         let name = host_name(host).to_ascii_lowercase();
         if name.is_empty() {
-            return false;
+            return None;
         }
-        name == "localhost"
+        let loopback = name == "localhost"
             || name.ends_with(".localhost")
-            || name.ends_with(".ts.net")
             || name
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-            || self.extra.iter().any(|extra| extra == &name)
+                .is_ok_and(|ip| ip.is_loopback());
+        if loopback {
+            Some(HostKind::Loopback)
+        } else if name.ends_with(".ts.net") || self.extra.iter().any(|extra| extra == &name) {
+            Some(HostKind::Tailnet)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn allows(&self, host: &str) -> bool {
+        self.classify(host).is_some()
     }
 }
 
@@ -65,12 +93,35 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &header::HeaderName) -> Option<&
 #[must_use]
 pub fn check(policy: &HostPolicy, method: &Method, headers: &HeaderMap) -> Option<String> {
     let host = header_str(headers, &header::HOST);
-    if let Some(host) = host
-        && !policy.allows(host)
-    {
-        return Some(format!(
-            "host `{host}` is not allowed; pass --allow-host to fleetd"
-        ));
+    let kind = match host {
+        Some(host) => match policy.classify(host) {
+            Some(kind) => Some(kind),
+            None => {
+                return Some(format!(
+                    "host `{host}` is not allowed; pass --allow-host to fleetd"
+                ));
+            }
+        },
+        None => None,
+    };
+    // Si el proxy no conservara `Host`, lo delata que traiga X-Forwarded-For o la identidad
+    let proxied = headers.contains_key("x-forwarded-for") || headers.contains_key(TAILSCALE_LOGIN);
+    if kind == Some(HostKind::Tailnet) || proxied {
+        match headers.get(TAILSCALE_LOGIN).and_then(|v| v.to_str().ok()) {
+            Some(login) if policy.logins.iter().any(|allowed| allowed == login) => {}
+            Some(login) => {
+                return Some(format!(
+                    "tailnet user `{login}` is not allowed; pass --allow-login to fleetd"
+                ));
+            }
+            None => {
+                return Some(
+                    "requests over the tailnet must come through `tailscale serve` from a \
+                     device of an allowed user"
+                        .to_owned(),
+                );
+            }
+        }
     }
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
         return None;
@@ -119,11 +170,27 @@ mod tests {
         map
     }
 
+    const OWNER: &str = "owner@example.com";
+
+    fn owner_policy() -> HostPolicy {
+        HostPolicy {
+            extra: Vec::new(),
+            logins: vec![OWNER.to_owned()],
+        }
+    }
+
     #[test]
     fn loopback_tailnet_and_extra_hosts_are_allowed() {
         let policy = HostPolicy {
             extra: vec!["pc".to_owned()],
+            logins: Vec::new(),
         };
+        assert_eq!(policy.classify("127.0.0.1:7171"), Some(HostKind::Loopback));
+        assert_eq!(policy.classify("pc:7171"), Some(HostKind::Tailnet));
+        assert_eq!(
+            policy.classify("pc.tail1234.ts.net"),
+            Some(HostKind::Tailnet)
+        );
         for host in [
             "127.0.0.1:7171",
             "localhost:7171",
@@ -173,7 +240,7 @@ mod tests {
 
     #[test]
     fn writes_need_the_same_origin() {
-        let policy = HostPolicy::default();
+        let policy = owner_policy();
         let post = Method::POST;
         assert_eq!(
             check(&policy, &post, &headers(&[("host", "127.0.0.1:7171")])),
@@ -197,6 +264,7 @@ mod tests {
                 &headers(&[
                     ("host", "127.0.0.1:7171"),
                     ("x-forwarded-host", "pc.tail1234.ts.net"),
+                    ("tailscale-user-login", OWNER),
                     ("origin", "https://pc.tail1234.ts.net")
                 ])
             ),
@@ -210,5 +278,35 @@ mod tests {
             };
             assert!(check(&policy, &post, &map).is_some(), "{origin}");
         }
+    }
+
+    #[test]
+    fn the_tailnet_needs_the_owner_identity() {
+        let policy = owner_policy();
+        let get = Method::GET;
+        let via_serve = |login: Option<&'static str>| {
+            let mut map = headers(&[("host", "pc.tail1234.ts.net")]);
+            if let Some(login) = login {
+                map.insert(TAILSCALE_LOGIN, HeaderValue::from_static(login));
+            }
+            map
+        };
+        assert_eq!(check(&policy, &get, &via_serve(Some(OWNER))), None);
+        // Sin identidad: un dispositivo etiquetado o algo que no pasó por `tailscale serve`
+        assert!(check(&policy, &get, &via_serve(None)).is_some());
+        assert!(check(&policy, &get, &via_serve(Some("friend@example.com"))).is_some());
+        // Nadie de la tailnet si no se sabe de quién es la máquina
+        assert!(check(&HostPolicy::default(), &get, &via_serve(Some(OWNER))).is_some());
+        // Un proxy que reescribiera `Host` a loopback no se salta la comprobación
+        let rewritten = headers(&[
+            ("host", "127.0.0.1:7171"),
+            ("x-forwarded-for", "100.64.0.2"),
+        ]);
+        assert!(check(&policy, &get, &rewritten).is_some());
+        // En loopback, sin proxy por medio, como siempre
+        assert_eq!(
+            check(&policy, &get, &headers(&[("host", "localhost:7171")])),
+            None
+        );
     }
 }

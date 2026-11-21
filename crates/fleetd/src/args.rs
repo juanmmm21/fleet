@@ -4,7 +4,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 pub const USAGE: &str = "usage: fleetd [--listen 127.0.0.1:7171] [--state-dir DIR] \
-                         [--repos-root DIR] [--allow-host NAME]... | --version | --help";
+                         [--repos-root DIR] [--allow-host NAME]... [--allow-login LOGIN]... \
+                         | --version | --help";
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7171";
 
 /// Qué pide la línea de órdenes.
@@ -23,6 +24,8 @@ pub struct ServeArgs {
     pub repos_root: PathBuf,
     /// Nombres de máquina aceptados en `Host` además de loopback y `*.ts.net`.
     pub allow_hosts: Vec<String>,
+    /// Logins de Tailscale que pueden entrar por la tailnet además del dueño de la máquina.
+    pub allow_logins: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -41,6 +44,8 @@ pub enum ArgsError {
     NoStateDir,
     #[error("cannot find the repos folder: set HOME or pass --repos-root")]
     NoReposRoot,
+    #[error("`{0}` is not a Tailscale login")]
+    BadLogin(String),
     #[error("`{0}` must be an absolute path")]
     NotAbsolute(String),
 }
@@ -55,6 +60,7 @@ where
     let mut state_dir = None;
     let mut allow_hosts = Vec::new();
     let mut repos_root = None;
+    let mut allow_logins = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -72,6 +78,15 @@ where
                     return Err(ArgsError::NotAbsolute(raw));
                 }
                 repos_root = Some(PathBuf::from(raw));
+            }
+            "--allow-login" => {
+                let login = args
+                    .next()
+                    .ok_or(ArgsError::MissingValue("--allow-login"))?;
+                if login.is_empty() || login.chars().any(char::is_whitespace) {
+                    return Err(ArgsError::BadLogin(login));
+                }
+                allow_logins.push(login);
             }
             "--allow-host" => {
                 let host = args.next().ok_or(ArgsError::MissingValue("--allow-host"))?;
@@ -101,6 +116,7 @@ where
         state_dir,
         repos_root,
         allow_hosts,
+        allow_logins,
     }))
 }
 
@@ -151,6 +167,7 @@ mod tests {
                 state_dir: PathBuf::from("/home/juan/.local/state/fleet"),
                 repos_root: PathBuf::from("/home/juan/Desarrollo"),
                 allow_hosts: Vec::new(),
+                allow_logins: Vec::new(),
             }))
         );
         let xdg = |key: &str| match key {
@@ -182,7 +199,9 @@ mod tests {
                     "--allow-host",
                     "PC",
                     "--allow-host",
-                    "mac.local"
+                    "mac.local",
+                    "--allow-login",
+                    "friend@example.com"
                 ]),
                 |_| None
             ),
@@ -193,11 +212,16 @@ mod tests {
                 state_dir: PathBuf::from("/tmp/fleet"),
                 repos_root: PathBuf::from("/srv/repos"),
                 allow_hosts: vec!["pc".to_owned(), "mac.local".to_owned()],
+                allow_logins: vec!["friend@example.com".to_owned()],
             }))
         );
         assert_eq!(
             parse(args(&["--repos-root", "repos"]), home),
             Err(ArgsError::NotAbsolute("repos".to_owned()))
+        );
+        assert_eq!(
+            parse(args(&["--allow-login", "a b"]), home),
+            Err(ArgsError::BadLogin("a b".to_owned()))
         );
         for bad in ["http://pc", "pc:7171", ""] {
             assert_eq!(

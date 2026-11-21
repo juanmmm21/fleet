@@ -7,6 +7,7 @@ use anyhow::Context;
 use fleetd::api::{self, AppState};
 use fleetd::args::{self, Command, ServeArgs, USAGE};
 use fleetd::guard::HostPolicy;
+use fleetd::tailnet::Tailscale;
 use fleetd::{Engine, EngineConfig};
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -60,6 +61,7 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
         .context("cannot read the host name")?
         .to_string_lossy()
         .into_owned();
+    let logins = tailnet_logins(&serve_args).await;
     let listener = tokio::net::TcpListener::bind(serve_args.listen)
         .await
         .with_context(|| format!("cannot listen on {}", serve_args.listen))?;
@@ -89,6 +91,7 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
         shutdown: stopping_rx,
         hosts: HostPolicy {
             extra: serve_args.allow_hosts.clone(),
+            logins,
         },
         repos_root: serve_args.repos_root.clone(),
     };
@@ -96,4 +99,21 @@ async fn serve(serve_args: ServeArgs) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown)
         .await
         .context("the HTTP server stopped")
+}
+
+/// Quién puede entrar por la tailnet: el dueño de esta máquina según Tailscale y los de
+/// `--allow-login`. Sin Tailscale, fleetd sigue funcionando en loopback.
+async fn tailnet_logins(serve_args: &ServeArgs) -> Vec<String> {
+    let mut logins = serve_args.allow_logins.clone();
+    match Tailscale::default().status().await {
+        Ok(status) => match status.this.login {
+            Some(owner) => {
+                eprintln!("fleetd: tailnet {} (owner {owner})", status.this.dns_name);
+                logins.push(owner);
+            }
+            None => eprintln!("fleetd: tailnet without a known owner for this machine"),
+        },
+        Err(err) => eprintln!("fleetd: no tailnet ({err}); serving on loopback only"),
+    }
+    logins
 }
