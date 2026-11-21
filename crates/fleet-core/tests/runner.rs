@@ -5,7 +5,10 @@ use std::time::{Duration, SystemTime};
 
 use fleet_core::runner::{self, RunConfig};
 use fleet_core::worktree::{self, ChangeKind, Worktree, WorktreeConfig};
-use fleet_core::{OutputLine, Stream, StreamEnd, TaskId};
+use fleet_core::{
+    AgentOutcome, AgentPrograms, AgentProvider, Invocation, OutputLine, Stream, StreamEnd, TaskId,
+    Transcript,
+};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -44,17 +47,33 @@ async fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     })
 }
 
-fn agent(script: &str) -> Command {
-    let mut command = Command::new("sh");
+/// El «agente» commitea con una identidad de prueba, sin tocar la configuración de nadie.
+fn test_identity(command: &mut Command) {
     command
-        .arg("-c")
-        .arg(script)
-        // El «agente» commitea con una identidad de prueba, sin tocar la configuración de nadie
         .env("GIT_AUTHOR_NAME", "fleet-test")
         .env("GIT_AUTHOR_EMAIL", "fleet-test@example.invalid")
         .env("GIT_COMMITTER_NAME", "fleet-test")
         .env("GIT_COMMITTER_EMAIL", "fleet-test@example.invalid");
-    command
+}
+
+fn agent(script: &str) -> Invocation {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script);
+    test_identity(&mut command);
+    Invocation {
+        command,
+        stdin: Vec::new(),
+        transcript: Transcript::for_provider(&AgentProvider::Claude { model: None }),
+    }
+}
+
+/// Un ejecutable de mentira que imita a una CLI de agente.
+fn fake_cli(dir: &Path, name: &str, body: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
 }
 
 fn quick() -> RunConfig {
@@ -198,7 +217,11 @@ async fn a_missing_agent_program_is_an_error_not_a_hang() -> TestResult {
     let result = runner::run_agent(
         &fx.config,
         &fx.worktree,
-        Command::new("fleet-no-such-agent"),
+        Invocation {
+            command: Command::new("fleet-no-such-agent"),
+            stdin: Vec::new(),
+            transcript: Transcript::for_provider(&AgentProvider::Agy { model: None }),
+        },
         &quick(),
         &fx.log(),
         std::future::pending(),
@@ -206,5 +229,129 @@ async fn a_missing_agent_program_is_an_error_not_a_hang() -> TestResult {
     )
     .await;
     assert!(matches!(result, Err(runner::RunError::Process(_))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fake_claude_gets_the_prompt_on_stdin_and_reports_its_result() -> TestResult {
+    let fx = fixture().await?;
+    let bin = fx.dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    // Comprueba el modo sin permisos, lee el encargo, commitea y responde como Claude Code
+    let claude = fake_cli(
+        &bin,
+        "claude",
+        r#"case "$*" in *"--permission-mode bypassPermissions"*) ;; *) exit 9 ;; esac
+prompt=$(cat)
+echo '{"type":"system","subtype":"init","session_id":"s-42","apiKeySource":"none"}'
+echo "$prompt" > prompt.txt
+git add prompt.txt && git -c commit.gpgsign=false commit --quiet -m prompt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"wrote it","num_turns":3,"session_id":"s-42"}'"#,
+    )?;
+    let programs = AgentPrograms {
+        claude,
+        ..AgentPrograms::default()
+    };
+    let mut invocation =
+        AgentProvider::Claude { model: None }.invocation(&programs, "write the prompt down")?;
+    test_identity(&mut invocation.command);
+
+    let report = runner::run_agent(
+        &fx.config,
+        &fx.worktree,
+        invocation,
+        &quick(),
+        &fx.log(),
+        std::future::pending(),
+        None,
+    )
+    .await?;
+    assert_eq!(report.end, StreamEnd::Exited(Some(0)));
+    assert_eq!(
+        read(&fx.worktree.path.join("prompt.txt"))?,
+        "write the prompt down\n"
+    );
+    assert_eq!(report.diff.commits, 1);
+    assert_eq!(report.summary.session_id.as_deref(), Some("s-42"));
+    assert_eq!(report.summary.turns, Some(3));
+    assert_eq!(
+        report.summary.outcome,
+        Some(AgentOutcome::Success {
+            text: "wrote it".to_owned()
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claude_on_a_paid_key_is_stopped_at_once() -> TestResult {
+    let fx = fixture().await?;
+    let bin = fx.dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let claude = fake_cli(
+        &bin,
+        "claude",
+        r#"cat > /dev/null
+echo '{"type":"system","subtype":"init","apiKeySource":"ANTHROPIC_API_KEY"}'
+sleep 30 & wait"#,
+    )?;
+    let programs = AgentPrograms {
+        claude,
+        ..AgentPrograms::default()
+    };
+    let invocation = AgentProvider::Claude { model: None }.invocation(&programs, "anything")?;
+    let report = runner::run_agent(
+        &fx.config,
+        &fx.worktree,
+        invocation,
+        &quick(),
+        &fx.log(),
+        std::future::pending(),
+        None,
+    )
+    .await?;
+    assert_eq!(report.end, StreamEnd::Cancelled);
+    assert!(report.duration_ms < 10_000);
+    assert!(
+        report
+            .summary
+            .refused
+            .as_deref()
+            .is_some_and(|r| r.contains("billed per use"))
+    );
+    assert!(read(&fx.log())?.contains("fleet stopped the agent"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fake_agy_reports_quota_exhaustion() -> TestResult {
+    let fx = fixture().await?;
+    let bin = fx.dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let agy = fake_cli(
+        &bin,
+        "agy",
+        r#"cat > /dev/null
+echo '{"event":"result","conversation_id":"c-1","result":{"status":"ERROR","error":"RESOURCE_EXHAUSTED"}}'
+exit 1"#,
+    )?;
+    let programs = AgentPrograms {
+        agy,
+        ..AgentPrograms::default()
+    };
+    let invocation = AgentProvider::Agy { model: None }.invocation(&programs, "anything")?;
+    let report = runner::run_agent(
+        &fx.config,
+        &fx.worktree,
+        invocation,
+        &quick(),
+        &fx.log(),
+        std::future::pending(),
+        None,
+    )
+    .await?;
+    assert_eq!(report.end, StreamEnd::Exited(Some(1)));
+    assert!(report.summary.quota_exhausted);
+    assert!(report.diff.is_empty());
     Ok(())
 }
