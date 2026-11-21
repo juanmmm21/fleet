@@ -252,8 +252,11 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"wrote it",
         claude,
         ..AgentPrograms::default()
     };
-    let mut invocation =
-        AgentProvider::Claude { model: None }.invocation(&programs, "write the prompt down")?;
+    let mut invocation = AgentProvider::Claude { model: None }.invocation(
+        &programs,
+        "write the prompt down",
+        None,
+    )?;
     test_identity(&mut invocation.command);
 
     let report = runner::run_agent(
@@ -267,9 +270,11 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"wrote it",
     )
     .await?;
     assert_eq!(report.end, StreamEnd::Exited(Some(0)));
-    assert_eq!(
-        read(&fx.worktree.path.join("prompt.txt"))?,
-        "write the prompt down\n"
+    let prompt = read(&fx.worktree.path.join("prompt.txt"))?;
+    assert!(prompt.starts_with("You are running unattended"), "{prompt}");
+    assert!(
+        prompt.ends_with("Task:\nwrite the prompt down\n"),
+        "{prompt}"
     );
     assert_eq!(report.diff.commits, 1);
     assert_eq!(report.summary.session_id.as_deref(), Some("s-42"));
@@ -299,7 +304,8 @@ sleep 30 & wait"#,
         claude,
         ..AgentPrograms::default()
     };
-    let invocation = AgentProvider::Claude { model: None }.invocation(&programs, "anything")?;
+    let invocation =
+        AgentProvider::Claude { model: None }.invocation(&programs, "anything", None)?;
     let report = runner::run_agent(
         &fx.config,
         &fx.worktree,
@@ -339,7 +345,7 @@ exit 1"#,
         agy,
         ..AgentPrograms::default()
     };
-    let invocation = AgentProvider::Agy { model: None }.invocation(&programs, "anything")?;
+    let invocation = AgentProvider::Agy { model: None }.invocation(&programs, "anything", None)?;
     let report = runner::run_agent(
         &fx.config,
         &fx.worktree,
