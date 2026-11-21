@@ -17,7 +17,7 @@ pub mod transcript;
 pub mod worktree;
 
 pub use agent::{AgentError, AgentPrograms, AgentProvider, Invocation};
-pub use preflight::{PreflightConfig, PreflightError, PreflightPlan, PreflightResult};
+pub use preflight::{ActPlan, PreflightConfig, PreflightError, PreflightPlan, PreflightResult};
 pub use process::{OutputLine, ProcessError, ProcessOutput, Stream, StreamEnd, StreamOptions};
 pub use recovery::{Recovered, Recovery, RecoveryError};
 pub use runner::{AgentReport, RunConfig, RunError};

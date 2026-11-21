@@ -2,6 +2,9 @@
 //!
 //! El comando sale de `fleet.toml` en la raíz del repo o, si no lo hay, de los ficheros que
 //! delatan el stack. Sin ninguno es un error: un repo sin pruebas conocidas nunca da verde.
+//!
+//! Opcionalmente (`[preflight.act]`), después de las pruebas nativas se repite un job de
+//! GitHub Actions con `act` (ver [`run_act`]).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -14,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::process::{self, OutputLine, ProcessError, Stream, StreamEnd, StreamOptions};
 use crate::runner::{Tail, open_log};
-use crate::worktree;
+use crate::worktree::{self, Worktree};
 
 /// Fichero de configuración de fleet en la raíz del repo.
 pub const CONFIG_FILE: &str = "fleet.toml";
@@ -30,14 +33,28 @@ pub struct PreflightPlan {
     pub timeout: Duration,
     /// De dónde salió: `fleet.toml` o el fichero que delató el stack.
     pub source: String,
+    /// Job de GitHub Actions que se repite con `act` si las pruebas nativas pasan.
+    pub act: Option<ActPlan>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Un job de GitHub Actions para `act`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActPlan {
+    pub job: String,
+    /// Opciones extra de `act` (`--container-architecture linux/amd64`, `-P ...`).
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreflightConfig {
     /// Plazo si `fleet.toml` no dice otro.
     pub default_timeout: Duration,
     pub grace: Duration,
     pub tail_bytes: usize,
+    pub act_program: PathBuf,
+    pub git_timeout: Duration,
 }
 
 impl Default for PreflightConfig {
@@ -46,6 +63,8 @@ impl Default for PreflightConfig {
             default_timeout: Duration::from_secs(30 * 60),
             grace: Duration::from_secs(10),
             tail_bytes: 16 * 1024,
+            act_program: PathBuf::from("act"),
+            git_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -66,6 +85,8 @@ pub enum PreflightError {
     Process(#[from] ProcessError),
     #[error("the pre-flight was cancelled")]
     Cancelled,
+    #[error("cannot prepare a clean clone for act: {0}")]
+    ActClone(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,47 +98,63 @@ struct ConfigFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreflightSection {
-    command: Vec<String>,
+    command: Option<Vec<String>>,
     timeout_secs: Option<u64>,
+    act: Option<ActPlan>,
 }
 
 /// Decide qué comando de pruebas tiene el repo que hay en `root`.
 pub fn plan(root: &Path, config: &PreflightConfig) -> Result<PreflightPlan, PreflightError> {
     let config_path = root.join(CONFIG_FILE);
-    if let Some(text) = read_optional(&config_path)? {
-        let parsed: ConfigFile = toml::from_str(&text).map_err(|error| PreflightError::Config {
-            path: config_path.clone(),
-            message: error.message().to_owned(),
-        })?;
-        if let Some(section) = parsed.preflight {
-            let invalid = |message: &str| PreflightError::Config {
-                path: config_path.clone(),
-                message: message.to_owned(),
-            };
-            if section
-                .command
+    let invalid = |message: &str| PreflightError::Config {
+        path: config_path.clone(),
+        message: message.to_owned(),
+    };
+    let section = match read_optional(&config_path)? {
+        Some(text) => {
+            toml::from_str::<ConfigFile>(&text)
+                .map_err(|error| invalid(error.message()))?
+                .preflight
+        }
+        None => None,
+    };
+    let section = section.unwrap_or(PreflightSection {
+        command: None,
+        timeout_secs: None,
+        act: None,
+    });
+    let timeout = match section.timeout_secs {
+        Some(0) => return Err(invalid("preflight.timeout_secs must be positive")),
+        Some(secs) => Duration::from_secs(secs),
+        None => config.default_timeout,
+    };
+    if let Some(act) = &section.act {
+        let bad_job = act.job.trim().is_empty() || act.job.starts_with('-');
+        if bad_job {
+            return Err(invalid("preflight.act.job must name a job"));
+        }
+    }
+    let (source, command) = match section.command {
+        Some(command) => {
+            if command
                 .first()
                 .is_none_or(|program| program.trim().is_empty())
             {
                 return Err(invalid("preflight.command must name a program"));
             }
-            let timeout = match section.timeout_secs {
-                Some(0) => return Err(invalid("preflight.timeout_secs must be positive")),
-                Some(secs) => Duration::from_secs(secs),
-                None => config.default_timeout,
-            };
-            return Ok(PreflightPlan {
-                command: section.command,
-                timeout,
-                source: CONFIG_FILE.to_owned(),
-            });
+            (CONFIG_FILE.to_owned(), command)
         }
-    }
-    let detected = detect(root)?.ok_or_else(|| PreflightError::NoCommand(root.to_path_buf()))?;
+        None => {
+            let (marker, command) =
+                detect(root)?.ok_or_else(|| PreflightError::NoCommand(root.to_path_buf()))?;
+            (marker.to_owned(), command)
+        }
+    };
     Ok(PreflightPlan {
-        command: detected.1,
-        timeout: config.default_timeout,
-        source: detected.0.to_owned(),
+        command,
+        timeout,
+        source,
+        act: section.act,
     })
 }
 
@@ -259,6 +296,73 @@ where
     Ok(result)
 }
 
+/// Repite el job `act.job` de GitHub Actions con `act` sobre lo commiteado en la rama de la
+/// tarea. `act` no entiende un worktree (ahí `.git` es un fichero, no una carpeta), así que se
+/// lanza en un clon local de usar y tirar de la rama, junto al worktree. Así además prueba lo
+/// mismo que se integraría: lo que está sin commitear no cuenta.
+pub async fn run_act<C>(
+    worktree: &Worktree,
+    act: &ActPlan,
+    timeout: Duration,
+    config: &PreflightConfig,
+    log: &Path,
+    cancel: C,
+) -> Result<PreflightResult, PreflightError>
+where
+    C: Future<Output = ()>,
+{
+    let clone = act_clone_path(&worktree.path)?;
+    remove_clone(&clone).await?;
+    let mut git = Command::new("git");
+    git.arg("clone")
+        .arg("--quiet")
+        .arg("--no-hardlinks")
+        .arg("--branch")
+        .arg(&worktree.branch)
+        .arg("--")
+        .arg(&worktree.repo)
+        .arg(&clone);
+    worktree::isolate_git_env(&mut git);
+    let cloned = process::run(git, config.git_timeout).await?;
+    if !cloned.success() {
+        return Err(PreflightError::ActClone(cloned.stderr.trim().to_owned()));
+    }
+    let mut command = vec![config.act_program.to_string_lossy().into_owned()];
+    command.extend(["-j".to_owned(), act.job.clone()]);
+    command.extend(act.args.iter().cloned());
+    let plan = PreflightPlan {
+        command,
+        timeout,
+        source: format!("act job `{}`", act.job),
+        act: None,
+    };
+    let result = run(&clone, &plan, config, log, cancel).await;
+    // El clon no tiene nada que no esté en la rama: se borra pase lo que pase
+    let removed = remove_clone(&clone).await;
+    let result = result?;
+    removed?;
+    Ok(result)
+}
+
+fn act_clone_path(worktree: &Path) -> Result<PathBuf, PreflightError> {
+    let name = worktree
+        .file_name()
+        .ok_or_else(|| PreflightError::ActClone(format!("{} has no name", worktree.display())))?;
+    let mut name = name.to_os_string();
+    name.push(".act");
+    Ok(worktree.with_file_name(name))
+}
+
+async fn remove_clone(path: &Path) -> Result<(), PreflightError> {
+    match tokio::fs::remove_dir_all(path).await {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(PreflightError::Io {
+            path: path.to_path_buf(),
+            source: error,
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Lo que salió de una ejecución del pre-flight.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightResult {
@@ -336,6 +440,28 @@ mod tests {
     }
 
     #[test]
+    fn act_can_go_with_detected_tests() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = planned(&[
+            ("Cargo.toml", ""),
+            (
+                "fleet.toml",
+                "[preflight]\ntimeout_secs = 60\n[preflight.act]\njob = \"test\"\nargs = [\"-P\", \"ubuntu-latest=node:20\"]\n",
+            ),
+        ])?;
+        assert_eq!(plan.command, ["cargo", "test"]);
+        assert_eq!(plan.source, "Cargo.toml");
+        assert_eq!(plan.timeout, Duration::from_secs(60));
+        assert_eq!(
+            plan.act,
+            Some(ActPlan {
+                job: "test".to_owned(),
+                args: vec!["-P".to_owned(), "ubuntu-latest=node:20".to_owned()],
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_fleet_toml_without_preflight_falls_back_to_detection()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = planned(&[("fleet.toml", ""), ("go.mod", "module x")])?;
@@ -352,6 +478,8 @@ mod tests {
             "[preflight]\ncommand = [\"make\"]\ntimeout_secs = 0\n",
             "[preflight]\ncommand = [\"make\"]\ntypo = 1\n",
             "[preflight\n",
+            "[preflight.act]\njob = \"--privileged\"\n",
+            "[preflight.act]\nargs = []\n",
         ] {
             let dir = repo(&[("fleet.toml", bad), ("Cargo.toml", "")])?;
             let result = plan(dir.path(), &PreflightConfig::default());
