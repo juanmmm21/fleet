@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use fleet_core::TaskId;
-use fleet_core::preflight::{self, PreflightConfig, PreflightError, PreflightPlan};
+use fleet_core::preflight::{self, ActPlan, PreflightConfig, PreflightError, PreflightPlan};
 use fleet_core::worktree::{self, Worktree, WorktreeConfig};
 use tempfile::TempDir;
 
@@ -37,6 +37,7 @@ fn config() -> PreflightConfig {
         default_timeout: Duration::from_secs(30),
         grace: Duration::from_secs(1),
         tail_bytes: 4096,
+        ..PreflightConfig::default()
     }
 }
 
@@ -170,5 +171,90 @@ async fn a_repo_without_tests_has_no_preflight() -> TestResult {
         preflight::plan(&wt.path, &config()),
         Err(PreflightError::NoCommand(_))
     ));
+    Ok(())
+}
+
+/// Un `act` de mentira: comprueba que está en un repo con `.git` de verdad y en qué rama.
+fn fake_act(dir: &std::path::Path, exit_code: i32) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("act");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ntest -d .git || {{ echo '.git is not a folder' >&2; exit 3; }}\n\
+             echo \"args=$*\"\necho \"branch=$(git rev-parse --abbrev-ref HEAD)\"\n\
+             ls\nexit {exit_code}\n"
+        ),
+    )?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+#[tokio::test]
+async fn act_runs_on_a_clean_clone_of_the_branch_and_cleans_up() -> TestResult {
+    let (dir, wt) = worktree_with(&[]).await?;
+    commit_file(&wt.path, "committed.txt", "in the branch\n")?;
+    std::fs::write(wt.path.join("pending.txt"), "not committed\n")?;
+    let config = PreflightConfig {
+        act_program: fake_act(dir.path(), 0)?,
+        ..config()
+    };
+    let act = ActPlan {
+        job: "test".to_owned(),
+        args: vec![
+            "--container-architecture".to_owned(),
+            "linux/amd64".to_owned(),
+        ],
+    };
+    let result = preflight::run_act(
+        &wt,
+        &act,
+        Duration::from_secs(30),
+        &config,
+        &log(&dir),
+        std::future::pending(),
+    )
+    .await?;
+    assert!(result.passed(), "{result:?}");
+    assert_eq!(
+        result.command[1..],
+        ["-j", "test", "--container-architecture", "linux/amd64"]
+    );
+    let tail = &result.output_tail;
+    assert!(tail.contains(&format!("branch={}", wt.branch)), "{tail}");
+    assert!(tail.contains("committed.txt"), "{tail}");
+    assert!(!tail.contains("pending.txt"), "{tail}");
+
+    let clone = wt.path.with_file_name(format!(
+        "{}.act",
+        wt.path.file_name().ok_or("no name")?.to_string_lossy()
+    ));
+    assert!(!clone.exists());
+    assert!(wt.path.join("pending.txt").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failing_act_job_is_a_red_preflight() -> TestResult {
+    let (dir, wt) = worktree_with(&[]).await?;
+    let config = PreflightConfig {
+        act_program: fake_act(dir.path(), 1)?,
+        ..config()
+    };
+    let act = ActPlan {
+        job: "lint".to_owned(),
+        args: Vec::new(),
+    };
+    let result = preflight::run_act(
+        &wt,
+        &act,
+        Duration::from_secs(30),
+        &config,
+        &log(&dir),
+        std::future::pending(),
+    )
+    .await?;
+    assert!(!result.passed());
+    assert_eq!(result.exit_code, Some(1));
     Ok(())
 }
