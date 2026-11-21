@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime};
 use fleet_core::runner::{self, RunConfig};
 use fleet_core::worktree::{self, ChangeKind, Worktree, WorktreeConfig};
 use fleet_core::{
-    AgentOutcome, AgentPrograms, AgentProvider, Invocation, OutputLine, Stream, StreamEnd, TaskId,
-    Transcript,
+    AgentOutcome, AgentPrograms, AgentProvider, Invocation, OutputLine, Store, Stream, StreamEnd,
+    Task, TaskId, TaskSpec, TaskState, Transcript,
 };
 use tempfile::TempDir;
 use tokio::process::Command;
@@ -359,5 +359,85 @@ exit 1"#,
     assert_eq!(report.end, StreamEnd::Exited(Some(1)));
     assert!(report.summary.quota_exhausted);
     assert!(report.diff.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_task_asks_waits_and_resumes_with_the_answer() -> TestResult {
+    let fx = fixture().await?;
+    let bin = fx.dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    // Primera vuelta: pregunta. Con `--resume s-1`: escribe la respuesta y commitea
+    let claude = fake_cli(
+        &bin,
+        "claude",
+        r#"input=$(cat)
+case "$*" in
+  *"--resume s-1"*)
+    echo "$input" > answer.txt
+    git add answer.txt && git -c commit.gpgsign=false commit --quiet -m answer
+    echo '{"type":"result","subtype":"success","result":"done","session_id":"s-1"}' ;;
+  *)
+    echo '{"type":"result","subtype":"success","result":"QUESTION: sqlite or plain files?","session_id":"s-1"}' ;;
+esac"#,
+    )?;
+    let programs = AgentPrograms {
+        claude,
+        ..AgentPrograms::default()
+    };
+    let store = Store::open(fx.dir.path().join("fleet.sqlite3")).await?;
+    let spec = TaskSpec {
+        repo: fx.worktree.repo.clone(),
+        prompt: "store the tasks".to_owned(),
+        agent: AgentProvider::Claude { model: None },
+        base: "main".to_owned(),
+    };
+    let mut task = Task::new(TaskId::parse("asks")?, spec, 1)?;
+    task.worktree = Some(fx.worktree.path.clone());
+    store.insert(&task).await?;
+    task.transition(TaskState::Agent, 2)?;
+    store.update(&task).await?;
+
+    let agent = task.agent.clone();
+    let run = |prompt: String, resume: Option<String>| {
+        let programs = programs.clone();
+        let agent = agent.clone();
+        let config = fx.config.clone();
+        let worktree = fx.worktree.clone();
+        let log = fx.log();
+        async move {
+            let mut invocation = agent.invocation(&programs, &prompt, resume.as_deref())?;
+            test_identity(&mut invocation.command);
+            let report = runner::run_agent(
+                &config,
+                &worktree,
+                invocation,
+                &quick(),
+                &log,
+                std::future::pending(),
+                None,
+            )
+            .await?;
+            Ok::<_, Box<dyn std::error::Error>>(report)
+        }
+    };
+
+    let first = run(task.prompt.clone(), None).await?;
+    runner::settle(&mut task, &first, 3)?;
+    store.update(&task).await?;
+    let stored = store.get(&task.id).await?.ok_or("task is missing")?;
+    assert_eq!(stored.state, TaskState::Waiting);
+    assert_eq!(stored.question.as_deref(), Some("sqlite or plain files?"));
+    assert_eq!(stored.session_id.as_deref(), Some("s-1"));
+
+    task.transition(TaskState::Agent, 4)?;
+    store.update(&task).await?;
+    let second = run("sqlite".to_owned(), stored.session_id.clone()).await?;
+    runner::settle(&mut task, &second, 5)?;
+    store.update(&task).await?;
+
+    assert_eq!(task.state, TaskState::Preflight);
+    assert_eq!(read(&fx.worktree.path.join("answer.txt"))?, "sqlite\n");
+    assert_eq!(second.diff.commits, 1);
     Ok(())
 }
