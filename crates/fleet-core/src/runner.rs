@@ -209,7 +209,7 @@ fn failure(report: &AgentReport) -> Option<String> {
     }
 }
 
-async fn open_log(path: &Path) -> std::io::Result<BufWriter<File>> {
+pub(crate) async fn open_log(path: &Path) -> std::io::Result<BufWriter<File>> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -280,14 +280,14 @@ impl Recorder {
 }
 
 /// Las últimas líneas que caben en un número de bytes.
-struct Tail {
+pub(crate) struct Tail {
     limit: usize,
     size: usize,
     lines: VecDeque<String>,
 }
 
 impl Tail {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             limit,
             size: 0,
@@ -295,7 +295,7 @@ impl Tail {
         }
     }
 
-    fn push(&mut self, line: String) {
+    pub(crate) fn push(&mut self, line: String) {
         // Con stream-json una sola línea puede ocupar más que todo el final: se guarda su cola
         if line.len() > self.limit {
             let mut cut = line.len() - self.limit;
@@ -317,7 +317,7 @@ impl Tail {
         }
     }
 
-    fn into_string(self) -> String {
+    pub(crate) fn into_string(self) -> String {
         self.lines.into_iter().collect()
     }
 }
