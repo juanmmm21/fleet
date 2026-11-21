@@ -2,12 +2,14 @@
 //! un `origin` desnudo, el checkout «de Juan» y otro clon para mover `origin` por detrás.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
 use fleet_core::TaskId;
 use fleet_core::worktree::{self, Removal, WorktreeConfig, WorktreeError};
 use tempfile::TempDir;
+
+mod common;
+use common::{commit_file, git};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -16,45 +18,6 @@ struct Fixture {
     origin: PathBuf,
     checkout: PathBuf,
     config: WorktreeConfig,
-}
-
-fn git(cwd: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .current_dir(cwd)
-        // Identidad de prueba solo para estos repos temporales
-        .args([
-            "-c",
-            "user.name=fleet-test",
-            "-c",
-            "user.email=fleet-test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "init.defaultBranch=main",
-        ])
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn commit_file(
-    repo: &Path,
-    name: &str,
-    content: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    std::fs::write(repo.join(name), content)?;
-    git(repo, &["add", name])?;
-    git(repo, &["commit", "--quiet", "-m", &format!("add {name}")])?;
-    git(repo, &["rev-parse", "HEAD"])
 }
 
 fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
